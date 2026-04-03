@@ -556,7 +556,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f8f9fa;color:#1a1a2e;m
 .pin-error{color:#dc2626;font-size:13px;min-height:18px}
 
 /* Layout */
-#admin-app{display:none;height:100vh}
+#admin-app{height:100vh}
 .admin-layout{display:flex;height:100vh}
 
 /* Sidebar */
@@ -728,7 +728,7 @@ tr:hover td{background:#f9fafb}
 <div class="pin-dots"><input type="tel" maxlength="1" autofocus><input type="tel" maxlength="1"><input type="tel" maxlength="1"><input type="tel" maxlength="1"></div>
 <div class="pin-error" id="pin-error"></div></div></div>
 
-<div id="admin-app">
+<div id="admin-app" style="display:none">
 <div class="mobile-header"><button class="hamburger" onclick="toggleSidebar()">${ICONS.menu}</button><h1>Ice Lab Team Store <span class="badge">Admin</span></h1><a href="/">${ICONS.store}</a></div>
 <div class="sidebar-overlay" id="sidebar-overlay" onclick="toggleSidebar()"></div>
 <div class="admin-layout">
