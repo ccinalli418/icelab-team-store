@@ -1,6 +1,5 @@
 // Ice Lab Team Store — Cloudflare Worker
-// Lightspeed Retail X-Series POS Integration
-// Customer-facing ordering portal with Stripe checkout
+// Price Book Based Team Catalogs with Lightspeed Retail X-Series POS Integration
 
 export default {
   async fetch(request, env) {
@@ -8,38 +7,28 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
-    // CORS preflight
     if (method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders() });
 
     // --- API Routes ---
     if (path.startsWith('/api/')) {
       try {
-        // Auth
         if (path === '/api/verify-pin' && method === 'POST') return apiVerifyPin(request, env);
         if (path === '/api/verify-admin-pin' && method === 'POST') return apiVerifyAdminPin(request, env);
-
-        // Public storefront
-        if (path === '/api/categories' && method === 'GET') return apiGetCategories(env);
+        if (path === '/api/teams' && method === 'GET') return apiGetTeams(env);
         if (path === '/api/products' && method === 'GET') return apiGetProducts(url, env);
-        if (path.match(/^\/api\/product\/[^/]+$/) && method === 'GET') return apiGetProduct(path.split('/')[3], env);
-
-        // Checkout
+        if (path.match(/^\/api\/product\/[^/]+$/) && method === 'GET') return apiGetProduct(url, path.split('/')[3], env);
         if (path === '/api/checkout' && method === 'POST') return apiCheckout(request, env);
         if (path === '/api/stripe/webhook' && method === 'POST') return apiStripeWebhook(request, env);
-
-        // Admin — Lightspeed
         if (path === '/api/admin/lightspeed/test' && method === 'GET') return apiLightspeedTest(env);
-        if (path === '/api/admin/lightspeed/sync' && method === 'GET') return apiLightspeedSync(env);
-        if (path === '/api/admin/lightspeed/toggle' && method === 'POST') return apiLightspeedToggle(request, env);
-        if (path === '/api/admin/lightspeed/price' && method === 'POST') return apiLightspeedPrice(request, env);
-        if (path === '/api/admin/import-products' && method === 'GET') return apiImportProducts(env);
-
-        // Admin — general
-        if (path === '/api/admin/orders' && method === 'GET') return apiAdminGetOrders(url, env);
-        if (path === '/api/admin/enabled-products' && method === 'GET') return apiAdminEnabledProducts(env);
+        if (path === '/api/admin/lightspeed/sync' && method === 'POST') return apiLightspeedSyncTeam(request, env);
+        if (path === '/api/admin/lightspeed/sync-all' && method === 'POST') return apiLightspeedSyncAll(env);
+        if (path === '/api/admin/import-products' && method === 'GET') return apiImportProducts(url, env);
+        if (path === '/api/admin/orders' && method === 'GET') return apiAdminGetOrders(env);
+        if (path === '/api/admin/products' && method === 'GET') return apiAdminAllProducts(env);
         if (path === '/api/admin/config' && method === 'GET') return apiAdminGetConfig(env);
         if (path === '/api/admin/config' && method === 'POST') return apiAdminSaveConfig(request, env);
-
+        if (path === '/api/admin/teams' && method === 'GET') return apiAdminGetTeams(env);
+        if (path === '/api/admin/teams' && method === 'POST') return apiAdminSaveTeams(request, env);
         return json({ error: 'Not found' }, 404);
       } catch (e) {
         console.error('API Error:', e.message, e.stack);
@@ -55,7 +44,7 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(cronSyncProducts(env));
+    ctx.waitUntil(cronSyncAllTeams(env));
   }
 };
 
@@ -76,7 +65,11 @@ function generateId(prefix) {
 }
 async function getConfig(env) {
   const config = await env.STORE_DATA.get('config', 'json');
-  return config || { storeName: 'Ice Lab Team Store', storePin: '1234', adminPin: '9999', stripePublishableKey: '', stripeSecretKey: '', stripeWebhookSecret: '', discountPercent: 15 };
+  return config || { storeName: 'Ice Lab Team Store', adminPin: '9999', stripePublishableKey: '', stripeSecretKey: '', stripeWebhookSecret: '' };
+}
+async function getTeams(env) {
+  const teams = await env.STORE_DATA.get('store:teams', 'json');
+  return teams || [];
 }
 function lsApi(env) {
   const prefix = env.LIGHTSPEED_DOMAIN_PREFIX || 'icelabproshop';
@@ -84,22 +77,6 @@ function lsApi(env) {
 }
 function lsHeaders(env) {
   return { 'Authorization': `Bearer ${env.LIGHTSPEED_API_TOKEN}`, 'Content-Type': 'application/json', 'Accept': 'application/json' };
-}
-
-// ============================================================
-// PIN VERIFICATION
-// ============================================================
-async function apiVerifyPin(request, env) {
-  const { pin } = await request.json();
-  const config = await getConfig(env);
-  if (pin === config.storePin) return json({ success: true });
-  return json({ error: 'Invalid PIN' }, 401);
-}
-async function apiVerifyAdminPin(request, env) {
-  const { pin } = await request.json();
-  const config = await getConfig(env);
-  if (pin === config.adminPin) return json({ success: true });
-  return json({ error: 'Invalid PIN' }, 401);
 }
 
 // ============================================================
@@ -123,9 +100,7 @@ async function lsFetchAll(env, endpoint) {
     if (data.version && data.version.max && data.version.max > after) {
       after = data.version.max;
       pages++;
-    } else {
-      break;
-    }
+    } else break;
     if (!key || data[key].length === 0) break;
   }
   return all;
@@ -142,261 +117,152 @@ async function lsFetch(env, endpoint, options = {}) {
 }
 
 // ============================================================
-// LIGHTSPEED ADMIN APIs
+// PIN VERIFICATION — Multi-team
 // ============================================================
-async function apiLightspeedTest(env) {
-  if (!env.LIGHTSPEED_API_TOKEN) return json({ success: false, error: 'LIGHTSPEED_API_TOKEN not configured' });
-  try {
-    const data = await lsFetch(env, 'outlets');
-    const outlets = data.outlets || data.data || [];
-    return json({ success: true, message: `Connected. Found ${outlets.length} outlet(s).`, outlets: outlets.map(o => ({ id: o.id, name: o.name })) });
-  } catch (e) {
-    return json({ success: false, error: e.message });
+async function apiVerifyPin(request, env) {
+  const { pin } = await request.json();
+  const teams = await getTeams(env);
+  const team = teams.find(t => t.pin === pin && t.enabled);
+  if (team) {
+    return json({ success: true, team: { name: team.name, slug: team.slug, priceBookId: team.priceBookId, logoUrl: team.logoUrl || '' } });
   }
+  return json({ error: 'Invalid PIN' }, 401);
 }
 
-async function apiLightspeedSync(env) {
-  if (!env.LIGHTSPEED_API_TOKEN) return json({ error: 'Lightspeed not configured' }, 400);
-  try {
-    const products = await lsFetchAll(env, 'products?page_size=100');
-    await env.STORE_DATA.put('ls_products_cache', JSON.stringify(products));
-    await env.STORE_DATA.put('ls_sync_timestamp', new Date().toISOString());
-
-    // Extract categories (brands/types from Lightspeed)
-    const brands = [...new Set(products.map(p => p.brand_name || p.supplier_name).filter(Boolean))];
-    const types = [...new Set(products.map(p => p.type || p.product_type_name || p.product_type).filter(Boolean))];
-
-    // Update enabled product configs with fresh data
-    let updatedCount = 0;
-    for (const p of products) {
-      const configKey = `ts_enabled:${p.id}`;
-      const existing = await env.STORE_DATA.get(configKey, 'json');
-      if (existing && existing.enabled) {
-        // Update stock and price from Lightspeed but keep team price override
-        existing.currentStock = p.inventory?.[0]?.current_amount ?? p.current_inventory ?? 0;
-        existing.retailPrice = parseFloat(p.price_including_tax || p.price || 0);
-        existing.name = p.name;
-        existing.updatedAt = new Date().toISOString();
-        await env.STORE_DATA.put(configKey, JSON.stringify(existing));
-        updatedCount++;
-      }
-    }
-
-    return json({
-      success: true,
-      totalProducts: products.length,
-      brands,
-      types,
-      updatedEnabled: updatedCount,
-      syncedAt: new Date().toISOString()
-    });
-  } catch (e) {
-    return json({ error: e.message }, 500);
-  }
-}
-
-async function apiLightspeedToggle(request, env) {
-  const { productId, enabled } = await request.json();
-  if (!productId) return json({ error: 'productId required' }, 400);
-
-  const configKey = `ts_enabled:${productId}`;
+async function apiVerifyAdminPin(request, env) {
+  const { pin } = await request.json();
   const config = await getConfig(env);
-  const discount = config.discountPercent || 15;
-
-  if (enabled) {
-    // Fetch fresh product data from cache
-    const cache = await env.STORE_DATA.get('ls_products_cache', 'json') || [];
-    const product = cache.find(p => p.id === productId);
-    if (!product) return json({ error: 'Product not found in cache. Run sync first.' }, 404);
-
-    const retailPrice = parseFloat(product.price_including_tax || product.price || 0);
-    const teamPrice = Math.round(retailPrice * (1 - discount / 100) * 100) / 100;
-
-    const tsConfig = {
-      enabled: true,
-      lightspeedId: productId,
-      name: product.name,
-      brand: product.brand_name || product.supplier_name || '',
-      sku: product.sku || product.supply_price ? '' : '',
-      retailPrice,
-      teamPrice,
-      currentStock: product.inventory?.[0]?.current_amount ?? product.current_inventory ?? 0,
-      images: product.images || product.image_url ? [product.image_url || product.images?.[0]?.url] : [],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-    await env.STORE_DATA.put(configKey, JSON.stringify(tsConfig));
-    return json(tsConfig);
-  } else {
-    const existing = await env.STORE_DATA.get(configKey, 'json');
-    if (existing) {
-      existing.enabled = false;
-      existing.updatedAt = new Date().toISOString();
-      await env.STORE_DATA.put(configKey, JSON.stringify(existing));
-    }
-    return json({ enabled: false, productId });
-  }
+  if (pin === config.adminPin) return json({ success: true });
+  return json({ error: 'Invalid PIN' }, 401);
 }
 
-async function apiLightspeedPrice(request, env) {
-  const { productId, teamPrice } = await request.json();
-  if (!productId) return json({ error: 'productId required' }, 400);
-  const configKey = `ts_enabled:${productId}`;
-  const existing = await env.STORE_DATA.get(configKey, 'json');
-  if (!existing) return json({ error: 'Product not enabled in team store' }, 404);
-  existing.teamPrice = parseFloat(teamPrice) || 0;
-  existing.updatedAt = new Date().toISOString();
-  await env.STORE_DATA.put(configKey, JSON.stringify(existing));
-  return json(existing);
+// ============================================================
+// TEAMS API (public — for showing team name on PIN page)
+// ============================================================
+async function apiGetTeams(env) {
+  const teams = await getTeams(env);
+  // Only return slug + name for public use
+  return json(teams.filter(t => t.enabled).map(t => ({ slug: t.slug, name: t.name, logoUrl: t.logoUrl || '' })));
 }
 
-async function apiImportProducts(env) {
-  const cache = await env.STORE_DATA.get('ls_products_cache', 'json') || [];
-  const syncTimestamp = await env.STORE_DATA.get('ls_sync_timestamp') || null;
-  const config = await getConfig(env);
+// ============================================================
+// PRICE BOOK SYNC
+// ============================================================
+async function syncPriceBook(env, priceBookId) {
+  // 1. Fetch price book products
+  const pbProducts = await lsFetchAll(env, `price_books/${priceBookId}/products`);
 
-  // Get enabled status for each product
+  // 2. Fetch product details for each (batched)
   const enriched = [];
-  for (const p of cache) {
-    const tsConfig = await env.STORE_DATA.get(`ts_enabled:${p.id}`, 'json');
-    enriched.push({
-      id: p.id,
-      name: p.name,
-      brand: p.brand_name || p.supplier_name || '',
-      sku: p.sku || '',
-      type: p.type || p.product_type_name || p.product_type || '',
-      retailPrice: parseFloat(p.price_including_tax || p.price || 0),
-      stock: p.inventory?.[0]?.current_amount ?? p.current_inventory ?? 0,
-      hasVariants: p.has_variants || false,
-      variantCount: p.variant_count || 0,
-      variantParentId: p.variant_parent_id || null,
-      variantName: p.variant_name || null,
-      images: p.images || (p.image_url ? [{ url: p.image_url }] : []),
-      imageUrl: p.image_url || p.images?.[0]?.url || null,
-      enabled: tsConfig?.enabled || false,
-      teamPrice: tsConfig?.teamPrice || null,
-      description: p.description || ''
-    });
+  for (const pbp of pbProducts) {
+    try {
+      const detail = await lsFetch(env, `products/${pbp.product_id}`);
+      const product = detail.data || detail.product || detail;
+      const parentName = product.name || pbp.name || '';
+      // Parse variant label from pbp.name (e.g. "Stick - SR / LFT / 77 / P90T")
+      let variantLabel = '';
+      const pbName = pbp.name || '';
+      // Variant label is after the base product name in the price book name
+      // Price book names include full variant: "Brand Model - Size / Hand / Flex / Curve"
+      if (product.variant_name && product.variant_name !== product.name) {
+        // variant_name has full name, name has parent name
+        variantLabel = product.variant_name.replace(product.name, '').replace(/^\s*\/\s*/, '').replace(/^\s*-\s*/, '').trim();
+        if (variantLabel.startsWith('/ ')) variantLabel = variantLabel.substring(2);
+      }
+      const cleanName = product.name || parentName;
+
+      // Fetch inventory for this product
+      let stock = 0;
+      try {
+        const invResp = await fetch(`${lsApi(env)}/inventory?product_id=${pbp.product_id}`, { headers: lsHeaders(env) });
+        if (invResp.ok) {
+          const invData = await invResp.json();
+          const inv = invData.data || [];
+          stock = inv.reduce((sum, i) => sum + (i.inventory_level || 0), 0);
+        }
+      } catch (e) { /* inventory fetch failed, default 0 */ }
+
+      // Check image - skip placeholder
+      let imageUrl = product.image_url || null;
+      if (imageUrl && imageUrl.includes('no-image-white-standard')) imageUrl = null;
+      if (!imageUrl && product.images && product.images.length > 0) imageUrl = product.images[0].url || null;
+
+      enriched.push({
+        lightspeedProductId: pbp.product_id,
+        parentId: product.variant_parent_id || null,
+        name: cleanName,
+        variantName: product.variant_name || pbName,
+        variantLabel: variantLabel,
+        sku: product.sku || '',
+        retailPrice: parseFloat(product.price_including_tax || 0),
+        teamPrice: parseFloat(pbp.price || 0),
+        imageUrl,
+        stock,
+        supplyPrice: parseFloat(product.supply_price || 0),
+        brand: product.brand?.name || product.supplier?.name || '',
+        type: product.type?.name || '',
+        hasVariants: product.has_variants || false,
+        discount: pbp.discount || null,
+        taxId: pbp.tax_id || null
+      });
+    } catch (e) {
+      console.error(`Failed to fetch product ${pbp.product_id}:`, e.message);
+      // Still include with price book data only
+      enriched.push({
+        lightspeedProductId: pbp.product_id,
+        parentId: null,
+        name: pbp.name || 'Unknown',
+        variantName: pbp.name || '',
+        variantLabel: '',
+        sku: '',
+        retailPrice: 0,
+        teamPrice: parseFloat(pbp.price || 0),
+        imageUrl: null,
+        stock: 0,
+        supplyPrice: 0,
+        brand: '',
+        type: '',
+        hasVariants: false,
+        discount: pbp.discount || null,
+        taxId: pbp.tax_id || null
+      });
+    }
   }
 
-  return json({
-    products: enriched,
-    syncTimestamp,
-    discountPercent: config.discountPercent || 15,
-    totalProducts: enriched.length
-  });
+  // 3. Cache
+  const cacheData = { products: enriched, syncedAt: new Date().toISOString() };
+  await env.STORE_DATA.put(`pb_cache:${priceBookId}`, JSON.stringify(cacheData));
+  return cacheData;
+}
+
+async function getCachedPriceBook(env, priceBookId) {
+  const cached = await env.STORE_DATA.get(`pb_cache:${priceBookId}`, 'json');
+  if (!cached) return null;
+  const age = Date.now() - new Date(cached.syncedAt).getTime();
+  if (age > 15 * 60 * 1000) return null; // stale after 15 min
+  return cached;
+}
+
+async function getPriceBookProducts(env, priceBookId) {
+  let cached = await getCachedPriceBook(env, priceBookId);
+  if (cached) return cached.products;
+  const fresh = await syncPriceBook(env, priceBookId);
+  return fresh.products;
 }
 
 // ============================================================
 // PUBLIC STOREFRONT APIs
 // ============================================================
-async function apiGetCategories(env) {
-  // Build categories from enabled products' brands/types
-  const cache = await env.STORE_DATA.get('ls_products_cache', 'json') || [];
-  const enabledProducts = [];
-  for (const p of cache) {
-    const tsConfig = await env.STORE_DATA.get(`ts_enabled:${p.id}`, 'json');
-    if (tsConfig?.enabled) enabledProducts.push({ ...p, tsConfig });
-  }
-  // Group by product type
-  const typeMap = {};
-  for (const p of enabledProducts) {
-    if (p.variant_parent_id) continue; // skip child variants for category counting
-    const type = p.type || p.product_type_name || p.product_type || 'Other';
-    if (!typeMap[type]) typeMap[type] = { id: type, name: type, count: 0 };
-    typeMap[type].count++;
-  }
-  return json(Object.values(typeMap).sort((a, b) => a.name.localeCompare(b.name)));
-}
-
-async function apiGetProducts(url, env) {
-  const category = url.searchParams.get('category');
-  const cache = await env.STORE_DATA.get('ls_products_cache', 'json') || [];
-  const config = await getConfig(env);
-  const discount = config.discountPercent || 15;
-
-  const enabledProducts = [];
-  for (const p of cache) {
-    const tsConfig = await env.STORE_DATA.get(`ts_enabled:${p.id}`, 'json');
-    if (!tsConfig?.enabled) continue;
-
-    const type = p.type || p.product_type_name || p.product_type || 'Other';
-    if (category && type !== category) continue;
-
-    enabledProducts.push(buildStorefrontProduct(p, tsConfig, discount));
-  }
-
-  // Group by variant_parent_id — show parent products as cards
-  const grouped = groupVariantProducts(enabledProducts);
-  return json(grouped);
-}
-
-async function apiGetProduct(id, env) {
-  const cache = await env.STORE_DATA.get('ls_products_cache', 'json') || [];
-  const config = await getConfig(env);
-  const discount = config.discountPercent || 15;
-
-  // Find the product (could be a parent or standalone)
-  const product = cache.find(p => p.id === id);
-  if (!product) return json({ error: 'Product not found' }, 404);
-
-  const tsConfig = await env.STORE_DATA.get(`ts_enabled:${id}`, 'json');
-  if (!tsConfig?.enabled) return json({ error: 'Product not available' }, 404);
-
-  const result = buildStorefrontProduct(product, tsConfig, discount);
-
-  // If this has variants, find all child variants
-  if (product.has_variants) {
-    const children = cache.filter(p => p.variant_parent_id === id);
-    result.variants = [];
-    for (const child of children) {
-      const childConfig = await env.STORE_DATA.get(`ts_enabled:${child.id}`, 'json');
-      result.variants.push({
-        id: child.id,
-        name: child.variant_name || child.name,
-        sku: child.sku || '',
-        retailPrice: parseFloat(child.price_including_tax || child.price || 0),
-        teamPrice: childConfig?.teamPrice || Math.round(parseFloat(child.price_including_tax || child.price || 0) * (1 - discount / 100) * 100) / 100,
-        stock: child.inventory?.[0]?.current_amount ?? child.current_inventory ?? 0,
-        enabled: childConfig?.enabled !== false
-      });
-    }
-  }
-
-  return json(result);
-}
-
-function buildStorefrontProduct(p, tsConfig, discount) {
-  const retailPrice = parseFloat(p.price_including_tax || p.price || 0);
-  const teamPrice = tsConfig?.teamPrice || Math.round(retailPrice * (1 - discount / 100) * 100) / 100;
-  return {
-    id: p.id,
-    name: p.name,
-    description: p.description || '',
-    brand: p.brand_name || p.supplier_name || '',
-    type: p.type || p.product_type_name || p.product_type || '',
-    sku: p.sku || '',
-    retailPrice,
-    teamPrice,
-    stock: p.inventory?.[0]?.current_amount ?? p.current_inventory ?? 0,
-    hasVariants: p.has_variants || false,
-    variantParentId: p.variant_parent_id || null,
-    variantName: p.variant_name || null,
-    imageUrl: p.image_url || p.images?.[0]?.url || null
-  };
-}
-
-function groupVariantProducts(products) {
+function groupByParent(products) {
   const parents = {};
   const standalone = [];
 
   for (const p of products) {
-    if (p.variantParentId) {
-      // This is a child variant
-      if (!parents[p.variantParentId]) {
-        parents[p.variantParentId] = {
-          id: p.variantParentId,
-          name: p.name?.replace(/ - .*$/, '') || p.name,
+    if (p.parentId) {
+      if (!parents[p.parentId]) {
+        parents[p.parentId] = {
+          id: p.parentId,
+          name: p.name,
           brand: p.brand,
           type: p.type,
           imageUrl: p.imageUrl,
@@ -404,42 +270,95 @@ function groupVariantProducts(products) {
           teamPrice: p.teamPrice,
           hasVariants: true,
           totalStock: 0,
-          variantCount: 0,
-          description: p.description
+          variants: []
         };
       }
-      parents[p.variantParentId].totalStock += (p.stock || 0);
-      parents[p.variantParentId].variantCount++;
-      // Use lowest team price
-      if (p.teamPrice < parents[p.variantParentId].teamPrice) {
-        parents[p.variantParentId].teamPrice = p.teamPrice;
-        parents[p.variantParentId].retailPrice = p.retailPrice;
+      parents[p.parentId].totalStock += (p.stock || 0);
+      parents[p.parentId].variants.push(p);
+      // Use first image found
+      if (!parents[p.parentId].imageUrl && p.imageUrl) {
+        parents[p.parentId].imageUrl = p.imageUrl;
       }
-      if (!parents[p.variantParentId].imageUrl && p.imageUrl) {
-        parents[p.variantParentId].imageUrl = p.imageUrl;
-      }
-    } else if (p.hasVariants) {
-      // This is a parent product — use it as the card
-      if (!parents[p.id]) {
-        parents[p.id] = { ...p, totalStock: p.stock || 0, variantCount: 0 };
-      } else {
-        parents[p.id] = { ...parents[p.id], ...p, totalStock: parents[p.id].totalStock + (p.stock || 0) };
+      // Use lowest team price for card display
+      if (p.teamPrice < parents[p.parentId].teamPrice) {
+        parents[p.parentId].teamPrice = p.teamPrice;
+        parents[p.parentId].retailPrice = p.retailPrice;
       }
     } else {
-      standalone.push({ ...p, totalStock: p.stock || 0 });
+      standalone.push({ ...p, id: p.lightspeedProductId, totalStock: p.stock || 0, hasVariants: false, variants: [] });
     }
   }
 
   return [...Object.values(parents), ...standalone];
 }
 
+async function apiGetProducts(url, env) {
+  const priceBookId = url.searchParams.get('priceBookId');
+  if (!priceBookId) return json({ error: 'priceBookId required' }, 400);
+
+  const products = await getPriceBookProducts(env, priceBookId);
+  const grouped = groupByParent(products);
+  return json(grouped);
+}
+
+async function apiGetProduct(url, productId, env) {
+  const priceBookId = url.searchParams.get('priceBookId');
+  if (!priceBookId) return json({ error: 'priceBookId required' }, 400);
+
+  const products = await getPriceBookProducts(env, priceBookId);
+
+  // Find all variants for this parent
+  const variants = products.filter(p => p.parentId === productId);
+  if (variants.length > 0) {
+    const first = variants[0];
+    return json({
+      id: productId,
+      name: first.name,
+      brand: first.brand,
+      type: first.type,
+      imageUrl: first.imageUrl || variants.find(v => v.imageUrl)?.imageUrl || null,
+      retailPrice: first.retailPrice,
+      teamPrice: first.teamPrice,
+      hasVariants: true,
+      totalStock: variants.reduce((s, v) => s + (v.stock || 0), 0),
+      variants: variants.map(v => ({
+        id: v.lightspeedProductId,
+        name: v.variantLabel || v.variantName,
+        sku: v.sku,
+        retailPrice: v.retailPrice,
+        teamPrice: v.teamPrice,
+        stock: v.stock,
+        imageUrl: v.imageUrl
+      }))
+    });
+  }
+
+  // Standalone product
+  const product = products.find(p => p.lightspeedProductId === productId);
+  if (!product) return json({ error: 'Product not found' }, 404);
+
+  return json({
+    id: product.lightspeedProductId,
+    name: product.name,
+    brand: product.brand,
+    type: product.type,
+    imageUrl: product.imageUrl,
+    retailPrice: product.retailPrice,
+    teamPrice: product.teamPrice,
+    hasVariants: false,
+    totalStock: product.stock || 0,
+    stock: product.stock || 0,
+    variants: []
+  });
+}
+
 // ============================================================
-// CHECKOUT API
+// CHECKOUT
 // ============================================================
 async function apiCheckout(request, env) {
   const config = await getConfig(env);
   if (!config.stripeSecretKey) return json({ error: 'Stripe not configured' }, 500);
-  const { items, customer } = await request.json();
+  const { items, customer, teamName, teamSlug } = await request.json();
   if (!items?.length) return json({ error: 'Cart is empty' }, 400);
   if (!customer?.name || !customer?.email || !customer?.phone) return json({ error: 'Customer info required' }, 400);
 
@@ -464,6 +383,8 @@ async function apiCheckout(request, env) {
       'customer_email': customer.email,
       'metadata[customerName]': customer.name,
       'metadata[customerPhone]': customer.phone,
+      'metadata[teamName]': teamName || '',
+      'metadata[teamSlug]': teamSlug || '',
       'metadata[items]': JSON.stringify(items),
       ...lineItems.reduce((acc, li, i) => {
         acc[`line_items[${i}][price_data][currency]`] = li.price_data.currency;
@@ -501,9 +422,12 @@ async function apiStripeWebhook(request, env) {
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const items = JSON.parse(session.metadata?.items || '[]');
+    const teamName = session.metadata?.teamName || '';
 
     const order = {
       id: generateId('ord'),
+      teamName,
+      teamSlug: session.metadata?.teamSlug || '',
       customer: {
         name: session.metadata?.customerName || '',
         email: session.customer_email || session.customer_details?.email || '',
@@ -519,7 +443,7 @@ async function apiStripeWebhook(request, env) {
       notificationSent: false
     };
 
-    // Try to create Lightspeed sale
+    // Create Lightspeed sale
     if (env.LIGHTSPEED_API_TOKEN) {
       try {
         const saleId = await createLightspeedSale(env, order);
@@ -537,7 +461,7 @@ async function apiStripeWebhook(request, env) {
     orderIds.unshift(order.id);
     await env.STORE_DATA.put('orders', JSON.stringify(orderIds));
 
-    // Send notification email
+    // Send notification
     try {
       await sendOrderNotification(env, order);
       order.notificationSent = true;
@@ -566,30 +490,23 @@ async function verifyStripeSignature(payload, sigHeader, secret) {
 // LIGHTSPEED SALE CREATION
 // ============================================================
 async function createLightspeedSale(env, order) {
-  // Get register
   const registersData = await lsFetch(env, 'registers');
   const registers = registersData.registers || registersData.data || [];
   if (!registers.length) throw new Error('No registers found');
   const registerId = registers[0].id;
 
-  // Get primary user
   const usersData = await lsFetch(env, 'users');
   const users = usersData.users || usersData.data || [];
   if (!users.length) throw new Error('No users found');
   const userId = users[0].id;
 
-  // Find or create customer
   let customerId = null;
   if (order.customer.email) {
     try {
       const custSearch = await lsFetch(env, `customers?email=${encodeURIComponent(order.customer.email)}`);
       const customers = custSearch.customers || custSearch.data || [];
-      if (customers.length > 0) {
-        customerId = customers[0].id;
-      }
-    } catch (e) {
-      console.error('Customer search failed:', e.message);
-    }
+      if (customers.length > 0) customerId = customers[0].id;
+    } catch (e) { console.error('Customer search failed:', e.message); }
   }
 
   if (!customerId && order.customer.email) {
@@ -597,61 +514,41 @@ async function createLightspeedSale(env, order) {
       const nameParts = (order.customer.name || '').split(' ');
       const newCust = await lsFetch(env, 'customers', {
         method: 'POST',
-        body: JSON.stringify({
-          first_name: nameParts[0] || '',
-          last_name: nameParts.slice(1).join(' ') || '',
-          email: order.customer.email,
-          phone: order.customer.phone || ''
-        })
+        body: JSON.stringify({ first_name: nameParts[0] || '', last_name: nameParts.slice(1).join(' ') || '', email: order.customer.email, phone: order.customer.phone || '' })
       });
       customerId = newCust.customer?.id || newCust.id;
-    } catch (e) {
-      console.error('Customer creation failed:', e.message);
-    }
+    } catch (e) { console.error('Customer creation failed:', e.message); }
   }
 
-  // Get a "layby/on account" payment type (or fallback)
   let paymentTypeId = null;
   try {
     const ptData = await lsFetch(env, 'payment_types');
     const paymentTypes = ptData.payment_types || ptData.data || [];
     const onAccount = paymentTypes.find(pt => pt.name?.toLowerCase().includes('account') || pt.name?.toLowerCase().includes('layby'));
     paymentTypeId = onAccount?.id || paymentTypes[0]?.id;
-  } catch (e) {
-    console.error('Payment types fetch failed:', e.message);
-  }
+  } catch (e) { console.error('Payment types fetch failed:', e.message); }
 
-  // Build sale products
+  const orderNum = order.id.slice(-6).toUpperCase();
   const saleProducts = order.items.map(item => ({
-    product_id: item.lightspeedId || item.productId,
+    product_id: item.lightspeedProductId || item.lightspeedId || item.productId,
     quantity: item.qty,
     price: item.teamPrice || item.price,
     tax: 0
   }));
 
-  // Build sale payload
   const salePayload = {
     register_id: registerId,
     user_id: userId,
     status: 'on_account',
-    note: `TEAM ORDER - Paid via Stripe - ${order.customer.name} - ${order.customer.phone}`,
+    note: `TEAM ORDER - ${order.teamName || 'Team Store'} | Paid via Stripe | Order #${orderNum}`,
     register_sale_products: saleProducts
   };
-
   if (customerId) salePayload.customer_id = customerId;
-
   if (paymentTypeId) {
-    salePayload.register_sale_payments = [{
-      payment_type_id: paymentTypeId,
-      amount: order.total
-    }];
+    salePayload.register_sale_payments = [{ payment_type_id: paymentTypeId, amount: order.total }];
   }
 
-  const saleResp = await lsFetch(env, 'register_sales', {
-    method: 'POST',
-    body: JSON.stringify(salePayload)
-  });
-
+  const saleResp = await lsFetch(env, 'register_sales', { method: 'POST', body: JSON.stringify(salePayload) });
   return saleResp.register_sale?.id || saleResp.id || 'unknown';
 }
 
@@ -660,6 +557,7 @@ async function createLightspeedSale(env, order) {
 // ============================================================
 async function sendOrderNotification(env, order) {
   const notifyEmail = env.NOTIFICATION_EMAIL || 'hello@icelabproshop.com';
+  const orderNum = order.id.slice(-6).toUpperCase();
 
   const itemRows = (order.items || []).map(item => {
     const name = item.name || 'Product';
@@ -670,7 +568,8 @@ async function sendOrderNotification(env, order) {
   const html = `
     <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
       <h2 style="color:#4f46e5">New Team Store Order</h2>
-      <p><strong>Order #:</strong> ${order.id.slice(-6).toUpperCase()}</p>
+      <p><strong>Order #:</strong> ${orderNum}</p>
+      <p><strong>Team:</strong> ${order.teamName || 'N/A'}</p>
       <p><strong>Customer:</strong> ${order.customer?.name || 'N/A'}</p>
       <p><strong>Email:</strong> ${order.customer?.email || 'N/A'}</p>
       <p><strong>Phone:</strong> ${order.customer?.phone || 'N/A'}</p>
@@ -688,7 +587,7 @@ async function sendOrderNotification(env, order) {
     body: JSON.stringify({
       personalizations: [{ to: [{ email: notifyEmail }] }],
       from: { email: 'noreply@icelabproshop.com', name: 'Ice Lab Team Store' },
-      subject: `New Team Order #${order.id.slice(-6).toUpperCase()} - ${order.customer?.name || 'Customer'}`,
+      subject: `New Team Order #${orderNum} - ${order.teamName || 'Team Store'} - ${order.customer?.name || 'Customer'}`,
       content: [{ type: 'text/html', value: html }]
     })
   });
@@ -697,35 +596,85 @@ async function sendOrderNotification(env, order) {
 // ============================================================
 // ADMIN APIs
 // ============================================================
-async function apiAdminGetOrders(url, env) {
+async function apiLightspeedTest(env) {
+  if (!env.LIGHTSPEED_API_TOKEN) return json({ success: false, error: 'LIGHTSPEED_API_TOKEN not configured' });
+  try {
+    const data = await lsFetch(env, 'outlets');
+    const outlets = data.outlets || data.data || [];
+    return json({ success: true, message: `Connected. Found ${outlets.length} outlet(s).`, outlets: outlets.map(o => ({ id: o.id, name: o.name })) });
+  } catch (e) {
+    return json({ success: false, error: e.message });
+  }
+}
+
+async function apiLightspeedSyncTeam(request, env) {
+  const { priceBookId } = await request.json();
+  if (!priceBookId) return json({ error: 'priceBookId required' }, 400);
+  if (!env.LIGHTSPEED_API_TOKEN) return json({ error: 'Lightspeed not configured' }, 400);
+  try {
+    const result = await syncPriceBook(env, priceBookId);
+    await env.STORE_DATA.put('ls_sync_timestamp', new Date().toISOString());
+    return json({ success: true, totalProducts: result.products.length, syncedAt: result.syncedAt });
+  } catch (e) {
+    return json({ error: e.message }, 500);
+  }
+}
+
+async function apiLightspeedSyncAll(env) {
+  if (!env.LIGHTSPEED_API_TOKEN) return json({ error: 'Lightspeed not configured' }, 400);
+  const teams = await getTeams(env);
+  const results = [];
+  for (const team of teams) {
+    if (!team.enabled || !team.priceBookId) continue;
+    try {
+      const result = await syncPriceBook(env, team.priceBookId);
+      results.push({ team: team.name, products: result.products.length, success: true });
+    } catch (e) {
+      results.push({ team: team.name, error: e.message, success: false });
+    }
+  }
+  await env.STORE_DATA.put('ls_sync_timestamp', new Date().toISOString());
+  return json({ success: true, results, syncedAt: new Date().toISOString() });
+}
+
+async function apiImportProducts(url, env) {
+  const priceBookId = url.searchParams.get('priceBookId');
+  if (!priceBookId) return json({ error: 'priceBookId required' }, 400);
+
+  // Try cache first (any age), then sync info
+  const cached = await env.STORE_DATA.get(`pb_cache:${priceBookId}`, 'json');
+  const syncTimestamp = cached?.syncedAt || await env.STORE_DATA.get('ls_sync_timestamp') || null;
+
+  return json({
+    products: cached?.products || [],
+    syncTimestamp,
+    totalProducts: cached?.products?.length || 0
+  });
+}
+
+async function apiAdminGetOrders(env) {
   const ids = await env.STORE_DATA.get('orders', 'json') || [];
   const orders = [];
-  for (const id of ids) {
+  for (const id of ids.slice(0, 100)) {
     const o = await env.STORE_DATA.get(`order:${id}`, 'json');
     if (o) orders.push(o);
   }
   return json(orders);
 }
 
-async function apiAdminEnabledProducts(env) {
-  const cache = await env.STORE_DATA.get('ls_products_cache', 'json') || [];
-  const enabled = [];
-  for (const p of cache) {
-    const tsConfig = await env.STORE_DATA.get(`ts_enabled:${p.id}`, 'json');
-    if (tsConfig?.enabled) {
-      enabled.push({
-        id: p.id,
-        name: p.name,
-        brand: p.brand_name || p.supplier_name || '',
-        sku: p.sku || '',
-        retailPrice: parseFloat(p.price_including_tax || p.price || 0),
-        teamPrice: tsConfig.teamPrice || 0,
-        stock: p.inventory?.[0]?.current_amount ?? p.current_inventory ?? 0,
-        imageUrl: p.image_url || p.images?.[0]?.url || null
-      });
+async function apiAdminAllProducts(env) {
+  const teams = await getTeams(env);
+  const allProducts = [];
+  for (const team of teams) {
+    if (!team.enabled || !team.priceBookId) continue;
+    const cached = await env.STORE_DATA.get(`pb_cache:${team.priceBookId}`, 'json');
+    if (cached?.products) {
+      for (const p of cached.products) {
+        allProducts.push({ ...p, teamName: team.name, teamSlug: team.slug });
+      }
     }
   }
-  return json(enabled);
+  return json(allProducts);
 }
 
 async function apiAdminGetConfig(env) { return json(await getConfig(env)); }
@@ -738,32 +687,31 @@ async function apiAdminSaveConfig(request, env) {
   return json(config);
 }
 
+async function apiAdminGetTeams(env) { return json(await getTeams(env)); }
+
+async function apiAdminSaveTeams(request, env) {
+  const { teams } = await request.json();
+  await env.STORE_DATA.put('store:teams', JSON.stringify(teams || []));
+  return json({ success: true, teams });
+}
+
 // ============================================================
 // CRON SYNC
 // ============================================================
-async function cronSyncProducts(env) {
+async function cronSyncAllTeams(env) {
   if (!env.LIGHTSPEED_API_TOKEN) return;
-  try {
-    const products = await lsFetchAll(env, 'products?page_size=100');
-    await env.STORE_DATA.put('ls_products_cache', JSON.stringify(products));
-    await env.STORE_DATA.put('ls_sync_timestamp', new Date().toISOString());
-
-    // Update enabled products
-    for (const p of products) {
-      const configKey = `ts_enabled:${p.id}`;
-      const existing = await env.STORE_DATA.get(configKey, 'json');
-      if (existing && existing.enabled) {
-        existing.currentStock = p.inventory?.[0]?.current_amount ?? p.current_inventory ?? 0;
-        existing.retailPrice = parseFloat(p.price_including_tax || p.price || 0);
-        existing.name = p.name;
-        existing.updatedAt = new Date().toISOString();
-        await env.STORE_DATA.put(configKey, JSON.stringify(existing));
-      }
+  const teams = await getTeams(env);
+  for (const team of teams) {
+    if (!team.enabled || !team.priceBookId) continue;
+    try {
+      await syncPriceBook(env, team.priceBookId);
+      console.log(`Cron sync: ${team.name} (${team.priceBookId}) synced`);
+    } catch (e) {
+      console.error(`Cron sync failed for ${team.name}:`, e.message);
     }
-    console.log(`Cron sync complete: ${products.length} products synced at ${new Date().toISOString()}`);
-  } catch (e) {
-    console.error('Cron sync failed:', e.message);
   }
+  await env.STORE_DATA.put('ls_sync_timestamp', new Date().toISOString());
+  console.log(`Cron sync complete at ${new Date().toISOString()}`);
 }
 
 // ============================================================
@@ -772,7 +720,6 @@ async function cronSyncProducts(env) {
 const ICONS = {
   cart: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="21" r="1"/><circle cx="20" cy="21" r="1"/><path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/></svg>',
   search: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>',
-  edit: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>',
   orders: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/></svg>',
   products: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m7.5 4.27 9 5.15"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg>',
   settings: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>',
@@ -784,7 +731,8 @@ const ICONS = {
   store: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m2 7 4.41-4.41A2 2 0 0 1 7.83 2h8.34a2 2 0 0 1 1.42.59L22 7"/><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><path d="M15 22v-4a2 2 0 0 0-2-2h-2a2 2 0 0 0-2 2v4"/><path d="M2 7h20"/><path d="M22 7v3a2 2 0 0 1-2 2a2.7 2.7 0 0 1-1.59-.63.7.7 0 0 0-.82 0A2.7 2.7 0 0 1 16 12a2.7 2.7 0 0 1-1.59-.63.7.7 0 0 0-.82 0A2.7 2.7 0 0 1 12 12a2.7 2.7 0 0 1-1.59-.63.7.7 0 0 0-.82 0A2.7 2.7 0 0 1 8 12a2.7 2.7 0 0 1-1.59-.63.7.7 0 0 0-.82 0A2.7 2.7 0 0 1 4 12a2 2 0 0 1-2-2V7"/></svg>',
   importIcon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>',
   sync: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>',
-  link: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>',
+  plus: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
+  trash: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>',
 };
 
 // ============================================================
@@ -795,14 +743,13 @@ function storePage() {
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}body{font-family:'Inter',system-ui,sans-serif;background:#f8f9fa;color:#1a1a2e;min-height:100vh}a{color:#4f46e5;text-decoration:none}
-#pin-screen{display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f8f9fa}.pin-box{text-align:center;background:#fff;padding:48px;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,0.08);border:1px solid #e5e7eb}.pin-box h1{font-size:24px;font-weight:700;margin-bottom:4px;color:#1a1a2e}.pin-box p{color:#6b7280;margin-bottom:24px;font-size:14px}.pin-dots{display:flex;gap:12px;justify-content:center;margin-bottom:16px}.pin-dots input{width:48px;height:56px;text-align:center;font-size:22px;background:#fff;border:1px solid #d1d5db;border-radius:8px;color:#1a1a2e;outline:none;transition:border 0.15s}.pin-dots input:focus{border-color:#4f46e5;box-shadow:0 0 0 3px rgba(79,70,229,0.1)}.pin-error{color:#dc2626;font-size:13px;min-height:18px}
-.sh{background:#fff;border-bottom:1px solid #e5e7eb;padding:0 24px;height:60px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;box-shadow:0 1px 3px rgba(0,0,0,0.04)}.sh-brand{font-size:16px;font-weight:700;color:#1a1a2e;letter-spacing:0.5px;cursor:pointer}.cart-btn{position:relative;background:#fff;border:1px solid #e5e7eb;color:#1a1a2e;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:500;display:flex;align-items:center;gap:6px;transition:all 0.15s}.cart-btn:hover{border-color:#d1d5db;background:#f9fafb}.cart-badge{background:#4f46e5;color:#fff;font-size:11px;font-weight:700;border-radius:50%;width:18px;height:18px;display:flex;align-items:center;justify-content:center}
+#pin-screen{display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f8f9fa}.pin-box{text-align:center;background:#fff;padding:48px;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,0.08);border:1px solid #e5e7eb;max-width:400px;width:100%}.pin-box h1{font-size:24px;font-weight:700;margin-bottom:4px;color:#1a1a2e}.pin-box .team-label{color:#4f46e5;font-size:14px;font-weight:600;margin-bottom:4px}.pin-box p{color:#6b7280;margin-bottom:24px;font-size:14px}.pin-dots{display:flex;gap:12px;justify-content:center;margin-bottom:16px}.pin-dots input{width:48px;height:56px;text-align:center;font-size:22px;background:#fff;border:1px solid #d1d5db;border-radius:8px;color:#1a1a2e;outline:none;transition:border 0.15s}.pin-dots input:focus{border-color:#4f46e5;box-shadow:0 0 0 3px rgba(79,70,229,0.1)}.pin-error{color:#dc2626;font-size:13px;min-height:18px}
+.sh{background:#fff;border-bottom:1px solid #e5e7eb;padding:0 24px;height:60px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;box-shadow:0 1px 3px rgba(0,0,0,0.04)}.sh-brand{font-size:16px;font-weight:700;color:#1a1a2e;letter-spacing:0.5px;cursor:pointer}.sh-brand .team-name{color:#4f46e5;font-weight:600}.cart-btn{position:relative;background:#fff;border:1px solid #e5e7eb;color:#1a1a2e;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:500;display:flex;align-items:center;gap:6px;transition:all 0.15s}.cart-btn:hover{border-color:#d1d5db;background:#f9fafb}.cart-badge{background:#4f46e5;color:#fff;font-size:11px;font-weight:700;border-radius:50%;width:18px;height:18px;display:flex;align-items:center;justify-content:center}
 .sc{max-width:1200px;margin:0 auto;padding:32px 24px}.st{font-size:20px;font-weight:700;margin-bottom:20px;color:#1a1a2e}
-.cg{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;margin-bottom:40px}.cc{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:24px;cursor:pointer;transition:all 0.15s;text-align:center}.cc:hover{border-color:#d1d5db;box-shadow:0 1px 3px rgba(0,0,0,0.08);transform:translateY(-1px)}.cc h3{font-size:15px;font-weight:600;margin-bottom:4px;color:#1a1a2e}.cc p{font-size:13px;color:#6b7280}
 .pg{display:grid;grid-template-columns:repeat(4,1fr);gap:20px}.pc{background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;cursor:pointer;transition:all 0.15s}.pc:hover{box-shadow:0 4px 12px rgba(0,0,0,0.08);transform:translateY(-2px)}.pc-img{height:200px;background:#f0f1f3;display:flex;align-items:center;justify-content:center}.pc-img img{width:100%;height:100%;object-fit:cover}.pc-info{padding:14px 16px}.pc-info h3{font-size:14px;font-weight:600;margin-bottom:4px;color:#1a1a2e;line-height:1.3}.pc-brand{font-size:11px;color:#6b7280;margin-bottom:6px}.pc-price-row{display:flex;align-items:center;justify-content:space-between;gap:8px}.pc-price{font-size:16px;font-weight:700;color:#1a1a2e}.pc-retail{font-size:12px;color:#9ca3af;text-decoration:line-through}.stock-badge{font-size:10px;font-weight:600;padding:2px 8px;border-radius:4px;white-space:nowrap}.stock-instock{background:#f0fdf4;color:#16a34a}.stock-order{background:#eff6ff;color:#2563eb}
-.pd{background:#fff;border-radius:8px;border:1px solid #e5e7eb;padding:32px;box-shadow:0 1px 3px rgba(0,0,0,0.08)}.pd-layout{display:grid;grid-template-columns:400px 1fr;gap:40px}.pd-image{height:400px;background:#f0f1f3;border-radius:8px;display:flex;align-items:center;justify-content:center;overflow:hidden}.pd-image img{width:100%;height:100%;object-fit:cover}.pd-info h2{font-size:22px;font-weight:700;margin-bottom:4px}.pd-brand{font-size:13px;color:#6b7280;margin-bottom:12px}.pd-info .price{font-size:24px;font-weight:700;color:#1a1a2e;margin-bottom:4px}.pd-info .retail-price{font-size:14px;color:#9ca3af;text-decoration:line-through;margin-bottom:16px}.pd-info .desc{color:#6b7280;margin-bottom:24px;line-height:1.6;font-size:14px}
+.pd{background:#fff;border-radius:8px;border:1px solid #e5e7eb;padding:32px;box-shadow:0 1px 3px rgba(0,0,0,0.08)}.pd-layout{display:grid;grid-template-columns:400px 1fr;gap:40px}.pd-image{height:400px;background:#f0f1f3;border-radius:8px;display:flex;align-items:center;justify-content:center;overflow:hidden}.pd-image img{width:100%;height:100%;object-fit:cover}.pd-info h2{font-size:22px;font-weight:700;margin-bottom:4px}.pd-brand{font-size:13px;color:#6b7280;margin-bottom:12px}.pd-info .price{font-size:24px;font-weight:700;color:#1a1a2e;margin-bottom:4px}.pd-info .retail-price{font-size:14px;color:#9ca3af;text-decoration:line-through;margin-bottom:16px}
 .vg{margin-bottom:16px}.vg label{display:block;font-size:12px;color:#6b7280;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px}.vg select{width:100%;padding:10px 12px;background:#fff;border:1px solid #d1d5db;border-radius:6px;color:#1a1a2e;font-size:14px;cursor:pointer;transition:border 0.15s}.vg select:focus{border-color:#4f46e5;outline:none;box-shadow:0 0 0 3px rgba(79,70,229,0.1)}
-.qty-row{display:flex;align-items:center;gap:12px;margin-bottom:20px}.qty-btn{width:36px;height:36px;border-radius:6px;border:1px solid #d1d5db;background:#fff;color:#1a1a2e;font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.15s}.qty-btn:hover{background:#f9fafb}.qty-val{font-size:16px;font-weight:600;min-width:30px;text-align:center}
+.qty-row{display:flex;align-items:center;gap:12px;margin-bottom:20px}.qty-btn{width:36px;height:36px;border-radius:6px;border:1px solid #d1d5db;background:#fff;color:#1a1a2e;font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.15s}.qty-btn:hover{background:#f9fafb}
 .stock-indicator{font-size:13px;padding:4px 10px;border-radius:4px;display:inline-block;margin-bottom:16px;font-weight:500}.si-green{background:#f0fdf4;color:#16a34a}.si-blue{background:#eff6ff;color:#2563eb}
 .back-link{display:inline-flex;align-items:center;gap:4px;color:#6b7280;font-size:13px;margin-bottom:16px;cursor:pointer;font-weight:500;transition:color 0.15s}.back-link:hover{color:#1a1a2e}
 .btn{padding:10px 20px;border-radius:6px;border:none;font-size:14px;font-weight:500;cursor:pointer;transition:all 0.15s;display:inline-flex;align-items:center;justify-content:center;gap:6px}.btn-primary{background:#4f46e5;color:#fff}.btn-primary:hover{background:#4338ca}.btn-primary:disabled{background:#c7d2fe;color:#818cf8;cursor:not-allowed}.btn-full{width:100%}.btn-lg{padding:14px 24px;font-size:15px;font-weight:600}
@@ -811,82 +758,113 @@ function storePage() {
 .toast{position:fixed;bottom:24px;right:24px;background:#1a1a2e;color:#fff;padding:10px 18px;border-radius:6px;font-size:13px;font-weight:500;z-index:300;transform:translateY(60px);opacity:0;transition:all 0.25s}.toast.show{transform:translateY(0);opacity:1}
 .loading{text-align:center;padding:60px;color:#6b7280;font-size:14px}
 @media(max-width:900px){.pg{grid-template-columns:repeat(2,1fr)}.pd-layout{grid-template-columns:1fr}}
-@media(max-width:480px){.pg{grid-template-columns:1fr}.cg{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:480px){.pg{grid-template-columns:1fr}}
 </style></head><body>
-<div id="pin-screen"><div class="pin-box"><h1>Ice Lab Team Store</h1><p>Enter PIN to access the store</p><div class="pin-dots"><input type="tel" maxlength="1" autofocus><input type="tel" maxlength="1"><input type="tel" maxlength="1"><input type="tel" maxlength="1"></div><div class="pin-error" id="pin-error"></div></div></div>
+<div id="pin-screen"><div class="pin-box"><h1>Ice Lab Team Store</h1><div class="team-label" id="pin-team-label" style="display:none"></div><p>Enter your team PIN to access the store</p><div class="pin-dots"><input type="tel" maxlength="1" autofocus><input type="tel" maxlength="1"><input type="tel" maxlength="1"><input type="tel" maxlength="1"></div><div class="pin-error" id="pin-error"></div></div></div>
 <div id="store-app" style="display:none">
-<header class="sh"><div class="sh-brand" onclick="showHome()">ICE LAB TEAM STORE</div><button class="cart-btn" onclick="toggleCart()">${ICONS.cart}<span id="cart-count" class="cart-badge">0</span></button></header>
+<header class="sh"><div class="sh-brand" onclick="showHome()">ICE LAB TEAM STORE <span class="team-name" id="header-team-name"></span></div><button class="cart-btn" onclick="toggleCart()">${ICONS.cart}<span id="cart-count" class="cart-badge">0</span></button></header>
 <main class="sc" id="main-content"></main></div>
 <div class="co" id="cart-overlay" onclick="toggleCart()"></div>
 <div class="cs" id="cart-sidebar"><div class="cs-header"><h2>Your Cart</h2><button class="cs-close" onclick="toggleCart()">${ICONS.x}</button></div><div class="cs-items" id="cart-items"></div><div class="cs-footer" id="cart-footer"></div></div>
 <div class="toast" id="toast"></div>
 <script>
-let categories=[],products=[],cart=JSON.parse(localStorage.getItem('icelab_cart')||'[]'),currentView='home',prevCategory=null;
+let products=[],cart=JSON.parse(sessionStorage.getItem('team_cart')||'[]'),currentView='home';
+let teamContext=JSON.parse(sessionStorage.getItem('team_context')||'null');
+
+// Check for ?team=slug param and show team name on PIN page
+(function(){
+  const params=new URLSearchParams(window.location.search);
+  const teamSlug=params.get('team');
+  if(teamSlug){
+    fetch('/api/teams').then(r=>r.json()).then(teams=>{
+      const team=teams.find(t=>t.slug===teamSlug);
+      if(team){
+        const label=document.getElementById('pin-team-label');
+        label.textContent=team.name;
+        label.style.display='block';
+      }
+    }).catch(()=>{});
+  }
+})();
 
 const pinInputs=document.querySelectorAll('.pin-dots input');
 pinInputs.forEach((inp,i)=>{inp.addEventListener('input',()=>{if(inp.value&&i<pinInputs.length-1)pinInputs[i+1].focus();if(i===pinInputs.length-1&&inp.value)checkPin()});inp.addEventListener('keydown',e=>{if(e.key==='Backspace'&&!inp.value&&i>0)pinInputs[i-1].focus()})});
-async function checkPin(){const pin=Array.from(pinInputs).map(i=>i.value).join('');if(pin.length<4)return;try{const r=await fetch('/api/verify-pin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin})});if(r.ok){sessionStorage.setItem('store_pin',pin);document.getElementById('pin-screen').style.display='none';document.getElementById('store-app').style.display='';loadStore()}else{document.getElementById('pin-error').textContent='Invalid PIN';pinInputs.forEach(i=>i.value='');pinInputs[0].focus()}}catch(e){document.getElementById('pin-error').textContent='Connection error'}}
-if(sessionStorage.getItem('store_pin')){document.getElementById('pin-screen').style.display='none';document.getElementById('store-app').style.display='';loadStore()}
+
+async function checkPin(){
+  const pin=Array.from(pinInputs).map(i=>i.value).join('');
+  if(pin.length<4)return;
+  try{
+    const r=await fetch('/api/verify-pin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin})});
+    const data=await r.json();
+    if(r.ok&&data.team){
+      teamContext=data.team;
+      sessionStorage.setItem('team_context',JSON.stringify(teamContext));
+      document.getElementById('pin-screen').style.display='none';
+      document.getElementById('store-app').style.display='';
+      loadStore();
+    }else{
+      document.getElementById('pin-error').textContent='Invalid PIN';
+      pinInputs.forEach(i=>i.value='');pinInputs[0].focus();
+    }
+  }catch(e){document.getElementById('pin-error').textContent='Connection error'}
+}
+
+if(teamContext){
+  document.getElementById('pin-screen').style.display='none';
+  document.getElementById('store-app').style.display='';
+  loadStore();
+}
 
 async function loadStore(){
+  if(!teamContext)return;
+  document.getElementById('header-team-name').textContent='- '+teamContext.name;
   document.getElementById('main-content').innerHTML='<div class="loading">Loading products...</div>';
-  const[cr,pr]=await Promise.all([fetch('/api/categories'),fetch('/api/products')]);
-  categories=await cr.json();
-  products=await pr.json();
+  try{
+    const r=await fetch('/api/products?priceBookId='+encodeURIComponent(teamContext.priceBookId));
+    products=await r.json();
+  }catch(e){products=[];}
   updateCartCount();
   showHome();
 }
 
 function showHome(){
-  currentView='home';prevCategory=null;
+  currentView='home';
   const m=document.getElementById('main-content');
-  let html='';
-  if(categories.length>1){
-    html+='<h2 class="st">Categories</h2><div class="cg">'+categories.map(c=>'<div class="cc" onclick="showCategory(\\''+esc(c.id)+'\\')"><h3>'+esc(c.name)+'</h3><p>'+c.count+' product'+(c.count!==1?'s':'')+'</p></div>').join('')+'</div>';
-  }
-  html+='<h2 class="st">All Products</h2>';
+  let html='<h2 class="st">All Products</h2>';
   if(products.length===0){html+='<div class="loading">No products available yet. Check back soon!</div>'}
   else{html+='<div class="pg">'+products.map(productCard).join('')+'</div>'}
   m.innerHTML=html;
 }
 
-function showCategory(catId){
-  currentView='category';prevCategory=catId;
-  const cat=categories.find(c=>c.id===catId);
-  const filtered=products.filter(p=>p.type===catId);
-  const m=document.getElementById('main-content');
-  m.innerHTML='<a class="back-link" onclick="showHome()">${ICONS.back} All Categories</a><h2 class="st">'+esc(cat?.name||catId)+'</h2>'+(filtered.length?'<div class="pg">'+filtered.map(productCard).join('')+'</div>':'<p style="color:#6b7280">No products in this category yet.</p>');
-}
-
 function productCard(p){
-  const stock=p.totalStock||p.stock||0;
+  const stock=p.totalStock!=null?p.totalStock:(p.stock||0);
   const stockBadge=stock>0?'<span class="stock-badge stock-instock">In Stock</span>':'<span class="stock-badge stock-order">Available to Order</span>';
   const img=p.imageUrl?'<img src="'+esc(p.imageUrl)+'">':'${ICONS.camera}';
-  const teamPrice=p.teamPrice||p.price||0;
+  const teamPrice=p.teamPrice||0;
   const retailPrice=p.retailPrice||0;
-  return '<div class="pc" onclick="showProduct(\\''+p.id+'\\')"><div class="pc-img">'+img+'</div><div class="pc-info">'+(p.brand?'<div class="pc-brand">'+esc(p.brand)+'</div>':'')+'<h3>'+esc(p.name)+'</h3><div class="pc-price-row"><div><span class="pc-price">$'+teamPrice.toFixed(2)+'</span>'+(retailPrice>teamPrice?' <span class="pc-retail">$'+retailPrice.toFixed(2)+'</span>':'')+'</div>'+stockBadge+'</div></div></div>';
+  return '<div class="pc" onclick="showProduct(\\''+esc(p.id)+'\\')"><div class="pc-img">'+img+'</div><div class="pc-info">'+(p.brand?'<div class="pc-brand">'+esc(p.brand)+'</div>':'')+'<h3>'+esc(p.name)+'</h3><div class="pc-price-row"><div><span class="pc-price">$'+teamPrice.toFixed(2)+'</span>'+(retailPrice>teamPrice?' <span class="pc-retail">$'+retailPrice.toFixed(2)+'</span>':'')+'</div>'+stockBadge+'</div></div></div>';
 }
 
 async function showProduct(prodId){
   currentView='product';
   document.getElementById('main-content').innerHTML='<div class="loading">Loading...</div>';
-  const r=await fetch('/api/product/'+prodId);
+  const r=await fetch('/api/product/'+prodId+'?priceBookId='+encodeURIComponent(teamContext.priceBookId));
   if(!r.ok){showHome();return}
   const p=await r.json();
   window._currentProduct=p;
   window._pdQty=1;
 
   const img=p.imageUrl?'<img src="'+esc(p.imageUrl)+'">':'${ICONS.camera}';
-  const stock=p.stock||0;
-  const stockHtml=stock>0?'<span class="stock-indicator si-green">In Stock - Available Now</span>':'<span class="stock-indicator si-blue">Available to Order - 1-2 Weeks</span>';
+  const stock=p.totalStock||p.stock||0;
+  const stockHtml=stock>0?'<span class="stock-indicator si-green">In Stock - Available Now</span>':'<span class="stock-indicator si-blue">Available to Order</span>';
 
   let variantHtml='';
   if(p.variants&&p.variants.length>0){
-    variantHtml='<div class="vg"><label>Options</label><select id="variant-select" onchange="onVariantChange()"><option value="">Select an option</option>'+p.variants.map(v=>'<option value="'+v.id+'" data-stock="'+(v.stock||0)+'" data-team="'+(v.teamPrice||0)+'" data-retail="'+(v.retailPrice||0)+'">'+esc(v.name)+(v.stock>0?' (In Stock)':' (Available to Order)')+'</option>').join('')+'</select></div>';
+    variantHtml='<div class="vg"><label>Options</label><select id="variant-select" onchange="onVariantChange()"><option value="">Select an option</option>'+p.variants.map(v=>'<option value="'+esc(v.id)+'" data-stock="'+(v.stock||0)+'" data-team="'+(v.teamPrice||0)+'" data-retail="'+(v.retailPrice||0)+'" data-name="'+esc(v.name)+'">'+esc(v.name)+(v.stock>0?' (In Stock)':' (Available to Order)')+'</option>').join('')+'</select></div>';
   }
 
   const m=document.getElementById('main-content');
-  m.innerHTML='<a class="back-link" onclick="goBack()">${ICONS.back} Back</a><div class="pd"><div class="pd-layout"><div class="pd-image">'+img+'</div><div class="pd-info"><h2>'+esc(p.name)+'</h2>'+(p.brand?'<div class="pd-brand">'+esc(p.brand)+'</div>':'')+'<div class="price" id="pd-price">$'+(p.teamPrice||0).toFixed(2)+'</div>'+(p.retailPrice>p.teamPrice?'<div class="retail-price" id="pd-retail">$'+p.retailPrice.toFixed(2)+'</div>':'')+'<p class="desc">'+esc(p.description)+'</p>'+variantHtml+'<div id="pd-stock-info">'+stockHtml+'</div><div class="qty-row"><span style="color:#6b7280;font-size:13px;font-weight:500">Qty</span><button class="qty-btn" onclick="changeQty(-1)">-</button><span class="qty-val" id="pd-qty">1</span><button class="qty-btn" onclick="changeQty(1)">+</button></div><button class="btn btn-primary btn-full btn-lg" id="btn-add" onclick="addToCart()"'+(p.variants&&p.variants.length?' disabled':'')+'>Add to Cart</button></div></div></div>';
+  m.innerHTML='<a class="back-link" onclick="showHome()">${ICONS.back} Back</a><div class="pd"><div class="pd-layout"><div class="pd-image">'+img+'</div><div class="pd-info"><h2>'+esc(p.name)+'</h2>'+(p.brand?'<div class="pd-brand">'+esc(p.brand)+'</div>':'')+'<div class="price" id="pd-price">$'+(p.teamPrice||0).toFixed(2)+'</div>'+(p.retailPrice>(p.teamPrice||0)?'<div class="retail-price" id="pd-retail">$'+p.retailPrice.toFixed(2)+'</div>':'')+'<div id="pd-stock-info">'+stockHtml+'</div>'+variantHtml+'<div class="qty-row"><span style="color:#6b7280;font-size:13px;font-weight:500">Qty</span><button class="qty-btn" onclick="changeQty(-1)">-</button><span class="qty-val" id="pd-qty">1</span><button class="qty-btn" onclick="changeQty(1)">+</button></div><button class="btn btn-primary btn-full btn-lg" id="btn-add" onclick="addToCart()"'+(p.variants&&p.variants.length?' disabled':'')+'>Add to Cart</button></div></div></div>';
 }
 
 function onVariantChange(){
@@ -903,48 +881,46 @@ function onVariantChange(){
   const retailEl=document.getElementById('pd-retail');
   if(retailEl){retailEl.textContent=retailPrice>teamPrice?'$'+retailPrice.toFixed(2):''}
   const si=document.getElementById('pd-stock-info');
-  si.innerHTML=stock>0?'<span class="stock-indicator si-green">In Stock - Available Now</span>':'<span class="stock-indicator si-blue">Available to Order - 1-2 Weeks</span>';
+  si.innerHTML=stock>0?'<span class="stock-indicator si-green">In Stock - Available Now</span>':'<span class="stock-indicator si-blue">Available to Order</span>';
 }
 
-function goBack(){if(currentView==='product'&&prevCategory)showCategory(prevCategory);else showHome()}
 function changeQty(d){window._pdQty=Math.max(1,(window._pdQty||1)+d);document.getElementById('pd-qty').textContent=window._pdQty}
 
 function addToCart(){
   const p=window._currentProduct;
   if(!p)return;
   const varSel=document.getElementById('variant-select');
-  let selectedVariant=null;
   let teamPrice=p.teamPrice||0;
   let variantName='';
-  let lightspeedId=p.id;
+  let lightspeedProductId=p.id;
 
   if(varSel&&varSel.value){
-    selectedVariant=p.variants.find(v=>v.id===varSel.value);
-    if(selectedVariant){
-      teamPrice=selectedVariant.teamPrice||teamPrice;
-      variantName=selectedVariant.name||'';
-      lightspeedId=selectedVariant.id;
+    const opt=varSel.options[varSel.selectedIndex];
+    const sv=p.variants.find(v=>v.id===varSel.value);
+    if(sv){
+      teamPrice=sv.teamPrice||teamPrice;
+      variantName=sv.name||'';
+      lightspeedProductId=sv.id;
     }
   }
 
   const ci={
-    productId:p.id,
-    lightspeedId:lightspeedId,
+    lightspeedProductId,
     name:p.name,
-    variantName:variantName,
-    teamPrice:teamPrice,
+    variantName,
+    teamPrice,
     price:teamPrice,
     qty:window._pdQty||1,
     imageUrl:p.imageUrl||null
   };
-  const ei=cart.findIndex(c=>c.lightspeedId===ci.lightspeedId);
+  const ei=cart.findIndex(c=>c.lightspeedProductId===ci.lightspeedProductId);
   if(ei>=0)cart[ei].qty+=ci.qty;
   else cart.push(ci);
   saveCart();
   showToast('Added to cart');
 }
 
-function saveCart(){localStorage.setItem('icelab_cart',JSON.stringify(cart));updateCartCount()}
+function saveCart(){sessionStorage.setItem('team_cart',JSON.stringify(cart));updateCartCount()}
 function updateCartCount(){document.getElementById('cart-count').textContent=cart.reduce((s,i)=>s+i.qty,0)}
 function toggleCart(){const o=document.getElementById('cart-overlay'),s=document.getElementById('cart-sidebar');if(s.classList.contains('open')){o.classList.remove('open');s.classList.remove('open')}else{renderCart();o.classList.add('open');s.classList.add('open')}}
 
@@ -967,7 +943,7 @@ async function checkout(){
   sessionStorage.setItem('co_name',n);sessionStorage.setItem('co_email',e);sessionStorage.setItem('co_phone',ph);
   const btn=document.getElementById('checkout-btn');btn.disabled=true;btn.textContent='Processing...';
   try{
-    const r=await fetch('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:cart,customer:{name:n,email:e,phone:ph}})});
+    const r=await fetch('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:cart,customer:{name:n,email:e,phone:ph},teamName:teamContext?.name||'',teamSlug:teamContext?.slug||''})});
     const d=await r.json();
     if(d.url)window.location.href=d.url;
     else{showToast(d.error||'Checkout failed');btn.disabled=false;btn.textContent='Checkout'}
@@ -980,7 +956,7 @@ function esc(s){if(!s)return '';return String(s).replace(/&/g,'&amp;').replace(/
 }
 
 function checkoutSuccessPage() {
-  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Order Confirmed</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Inter',system-ui,sans-serif;background:#f8f9fa;color:#1a1a2e}.rp{display:flex;align-items:center;justify-content:center;min-height:100vh}.rb{background:#fff;padding:48px;border-radius:12px;border:1px solid #e5e7eb;max-width:440px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08)}.rb h2{font-size:22px;font-weight:700;margin:16px 0 8px;color:#1a1a2e}.rb p{color:#6b7280;margin-bottom:24px;font-size:14px;line-height:1.6}.ri{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto;background:#f0fdf4;color:#16a34a}.btn{padding:10px 20px;border-radius:6px;border:none;font-size:14px;font-weight:500;cursor:pointer;background:#4f46e5;color:#fff;text-decoration:none;display:inline-block}</style></head><body><div class="rp"><div class="rb"><div class="ri">${ICONS.check}</div><h2>Order Confirmed</h2><p>Thanks for your order! We will have it ready for pickup at Ice Lab. You will receive a confirmation email shortly.</p><a href="/" class="btn">Continue Shopping</a></div></div><script>localStorage.removeItem('icelab_cart')</script></body></html>`;
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Order Confirmed</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Inter',system-ui,sans-serif;background:#f8f9fa;color:#1a1a2e}.rp{display:flex;align-items:center;justify-content:center;min-height:100vh}.rb{background:#fff;padding:48px;border-radius:12px;border:1px solid #e5e7eb;max-width:440px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08)}.rb h2{font-size:22px;font-weight:700;margin:16px 0 8px;color:#1a1a2e}.rb p{color:#6b7280;margin-bottom:24px;font-size:14px;line-height:1.6}.ri{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto;background:#f0fdf4;color:#16a34a}.btn{padding:10px 20px;border-radius:6px;border:none;font-size:14px;font-weight:500;cursor:pointer;background:#4f46e5;color:#fff;text-decoration:none;display:inline-block}</style></head><body><div class="rp"><div class="rb"><div class="ri">${ICONS.check}</div><h2>Order Confirmed</h2><p>Thanks for your order! We will have it ready for pickup at Ice Lab. You will receive a confirmation email shortly.</p><a href="/" class="btn">Continue Shopping</a></div></div><script>sessionStorage.removeItem('team_cart')</script></body></html>`;
 }
 
 function checkoutCancelPage() {
@@ -1002,25 +978,21 @@ function adminPage() {
 .admin-main{flex:1;overflow-y:auto;background:#f8f9fa;display:flex;flex-direction:column}
 .admin-topbar{background:#fff;border-bottom:1px solid #e5e7eb;padding:0 32px;height:52px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}.admin-topbar h2{font-size:16px;font-weight:600}.admin-topbar-actions{display:flex;align-items:center;gap:8px}.admin-topbar a{color:#4f46e5;font-size:13px;font-weight:500;text-decoration:none;display:flex;align-items:center;gap:4px}
 .admin-content{padding:32px;flex:1;overflow-y:auto}
-.card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.08);margin-bottom:24px}.card-header{padding:16px 20px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between}.card-header h3{font-size:15px;font-weight:600}.card-body{padding:20px}
+.card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.08);margin-bottom:24px}.card-header{padding:16px 20px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}.card-header h3{font-size:15px;font-weight:600}.card-body{padding:20px}
 table{width:100%;border-collapse:collapse}th{padding:10px 16px;text-align:left;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;background:#f8f9fa;border-bottom:1px solid #e5e7eb}td{padding:10px 16px;font-size:13px;border-bottom:1px solid #f0f0f0;vertical-align:middle}tr:hover td{background:#f9fafb}
-.prod-name{font-weight:600;font-size:13px;color:#1a1a2e}.prod-sku{font-size:11px;color:#6b7280;margin-top:1px}.prod-thumb{width:40px;height:40px;border-radius:4px;background:#f0f1f3;display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0}.prod-thumb img{width:100%;height:100%;object-fit:cover}.prod-thumb svg{width:16px;height:16px}.prod-cell{display:flex;align-items:center;gap:10px}
-.btn{padding:8px 16px;border-radius:6px;border:none;font-size:13px;font-weight:500;cursor:pointer;transition:all 0.15s;display:inline-flex;align-items:center;justify-content:center;gap:6px;font-family:inherit}.btn-primary{background:#4f46e5;color:#fff}.btn-primary:hover{background:#4338ca}.btn-outline{background:#fff;border:1px solid #d1d5db;color:#374151}.btn-outline:hover{background:#f9fafb}.btn-sm{padding:6px 12px;font-size:12px}.btn-success{background:#16a34a;color:#fff}.btn-success:hover{background:#15803d}.btn-ghost{background:none;border:none;color:#4f46e5;font-weight:500;cursor:pointer;font-size:13px;font-family:inherit;padding:0}.btn-ghost:hover{text-decoration:underline}
-.toggle{position:relative;width:36px;height:20px;display:inline-block}.toggle input{opacity:0;width:0;height:0}.toggle-slider{position:absolute;cursor:pointer;inset:0;background:#d1d5db;border-radius:20px;transition:0.15s}.toggle-slider:before{content:'';position:absolute;height:16px;width:16px;left:2px;bottom:2px;background:#fff;border-radius:50%;transition:0.15s}.toggle input:checked+.toggle-slider{background:#4f46e5}.toggle input:checked+.toggle-slider:before{transform:translateX(16px)}
+.prod-name{font-weight:600;font-size:13px;color:#1a1a2e}.prod-sku{font-size:11px;color:#6b7280;margin-top:1px}.prod-cell{display:flex;align-items:center;gap:10px}.prod-thumb{width:40px;height:40px;border-radius:4px;background:#f0f1f3;display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0}.prod-thumb img{width:100%;height:100%;object-fit:cover}
+.btn{padding:8px 16px;border-radius:6px;border:none;font-size:13px;font-weight:500;cursor:pointer;transition:all 0.15s;display:inline-flex;align-items:center;justify-content:center;gap:6px;font-family:inherit}.btn-primary{background:#4f46e5;color:#fff}.btn-primary:hover{background:#4338ca}.btn-outline{background:#fff;border:1px solid #d1d5db;color:#374151}.btn-outline:hover{background:#f9fafb}.btn-sm{padding:6px 12px;font-size:12px}.btn-danger{background:#dc2626;color:#fff}.btn-danger:hover{background:#b91c1c}.btn-ghost{background:none;border:none;color:#4f46e5;font-weight:500;cursor:pointer;font-size:13px;font-family:inherit;padding:0}.btn-ghost:hover{text-decoration:underline}
 .fg{margin-bottom:14px}.fg label{display:block;font-size:12px;color:#374151;margin-bottom:4px;font-weight:600}.fg input,.fg textarea,.fg select{width:100%;padding:8px 12px;background:#fff;border:1px solid #d1d5db;border-radius:6px;color:#1a1a2e;font-size:13px;font-family:inherit;transition:border 0.15s}.fg input:focus,.fg textarea:focus,.fg select:focus{border-color:#4f46e5;outline:none;box-shadow:0 0 0 3px rgba(79,70,229,0.1)}.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .settings-card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.08);padding:24px;margin-bottom:20px}.settings-card h3{font-size:14px;font-weight:600;margin-bottom:16px;color:#1a1a2e}
 .empty-state{text-align:center;color:#6b7280;padding:40px;font-size:14px}
 .badge-status{padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600;display:inline-block}.badge-success{background:#f0fdf4;color:#16a34a}.badge-warning{background:#fffbeb;color:#d97706}.badge-error{background:#fef2f2;color:#dc2626}.badge-info{background:#eff6ff;color:#2563eb}
 .search-bar{background:#f8f9fa;border:1px solid #e5e7eb;border-radius:8px;padding:16px;margin-bottom:16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}.search-input{flex:1;position:relative;min-width:200px}.search-input input{width:100%;padding:8px 12px 8px 32px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;color:#1a1a2e;background:#fff;font-family:inherit;transition:border 0.15s}.search-input input:focus{border-color:#4f46e5;outline:none;box-shadow:0 0 0 3px rgba(79,70,229,0.1)}.search-input input::placeholder{color:#9ca3af}.search-input .search-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:#9ca3af;display:flex}
 .filter-select{padding:8px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;color:#1a1a2e;background:#fff;font-family:inherit;cursor:pointer}
-.sync-info{display:flex;align-items:center;gap:8px;font-size:12px;color:#6b7280;padding:12px 20px;border-bottom:1px solid #f0f0f0;background:#f8f9fa}
-.price-input{width:80px;padding:5px 8px;border:1px solid #d1d5db;border-radius:4px;font-size:12px;color:#1a1a2e;background:#fff;text-align:right}
-.price-input:focus{border-color:#4f46e5;outline:none}
-.toast{position:fixed;bottom:24px;right:24px;background:#1a1a2e;color:#fff;padding:10px 18px;border-radius:6px;font-size:13px;font-weight:500;z-index:600;transform:translateY(60px);opacity:0;transition:all 0.25s}.toast.show{transform:translateY(0);opacity:1}
 .stat-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:16px;margin-bottom:24px}.stat-card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:16px}.stat-card .label{font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:#6b7280;font-weight:600;margin-bottom:4px}.stat-card .value{font-size:22px;font-weight:700;color:#1a1a2e}
-.od-info{display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px;padding:20px 24px;border-bottom:1px solid #e5e7eb}.od-info-item label{font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:#6b7280;font-weight:600;display:block;margin-bottom:2px}.od-info-item span{font-size:14px;color:#1a1a2e;font-weight:500}
-.back-link{display:inline-flex;align-items:center;gap:4px;color:#6b7280;font-size:13px;cursor:pointer;font-weight:500;margin-bottom:16px;transition:color 0.15s}.back-link:hover{color:#1a1a2e}
-@media(max-width:768px){.sidebar{display:none;position:fixed;top:0;left:0;bottom:0;z-index:301;box-shadow:4px 0 12px rgba(0,0,0,0.1)}.sidebar.open{display:flex}.sidebar-overlay.open{display:block}.mobile-header{display:flex}.admin-content{padding:16px}.admin-topbar{padding:0 16px}.od-info{grid-template-columns:1fr}.fg-row{grid-template-columns:1fr}.stat-cards{grid-template-columns:1fr 1fr}}
+.team-row{display:flex;gap:12px;align-items:flex-end;padding:12px 16px;background:#f8f9fa;border:1px solid #e5e7eb;border-radius:8px;margin-bottom:8px;flex-wrap:wrap}.team-row .fg{margin-bottom:0;flex:1;min-width:120px}.team-row .fg.narrow{max-width:100px}.team-row .fg.wide{min-width:200px}
+.toggle{position:relative;width:36px;height:20px;display:inline-block}.toggle input{opacity:0;width:0;height:0}.toggle-slider{position:absolute;cursor:pointer;inset:0;background:#d1d5db;border-radius:20px;transition:0.15s}.toggle-slider:before{content:'';position:absolute;height:16px;width:16px;left:2px;bottom:2px;background:#fff;border-radius:50%;transition:0.15s}.toggle input:checked+.toggle-slider{background:#4f46e5}.toggle input:checked+.toggle-slider:before{transform:translateX(16px)}
+.toast{position:fixed;bottom:24px;right:24px;background:#1a1a2e;color:#fff;padding:10px 18px;border-radius:6px;font-size:13px;font-weight:500;z-index:600;transform:translateY(60px);opacity:0;transition:all 0.25s}.toast.show{transform:translateY(0);opacity:1}
+@media(max-width:768px){.sidebar{display:none;position:fixed;top:0;left:0;bottom:0;z-index:301;box-shadow:4px 0 12px rgba(0,0,0,0.1)}.sidebar.open{display:flex}.sidebar-overlay.open{display:block}.mobile-header{display:flex}.admin-content{padding:16px}.admin-topbar{padding:0 16px}.fg-row{grid-template-columns:1fr}.stat-cards{grid-template-columns:1fr 1fr}.team-row{flex-direction:column}}
 </style></head><body>
 <div id="admin-pin-screen"><div class="pin-box"><h1>Admin Access</h1><p>Enter admin PIN</p><div class="pin-dots"><input type="tel" maxlength="1" autofocus><input type="tel" maxlength="1"><input type="tel" maxlength="1"><input type="tel" maxlength="1"></div><div class="pin-error" id="pin-error"></div></div></div>
 <div id="admin-app" style="display:none">
@@ -1039,8 +1011,8 @@ table{width:100%;border-collapse:collapse}th{padding:10px 16px;text-align:left;f
 </div></div></div>
 <div class="toast" id="toast"></div>
 <script>
-let importProducts=[],enabledProducts=[],adminOrders=[],currentTab='import',searchQuery='',brandFilter='',showEnabledOnly=false;
-let syncTimestamp=null,discountPercent=15;
+let adminTeams=[],importProducts=[],allProducts=[],adminOrders=[],adminConfig={};
+let currentTab='import',searchQuery='',selectedTeamIdx=0;
 const IC=${JSON.stringify(ICONS)};
 
 // PIN
@@ -1051,7 +1023,14 @@ if(sessionStorage.getItem('admin_pin')){document.getElementById('admin-pin-scree
 
 function toggleSidebar(){document.getElementById('sidebar').classList.toggle('open');document.getElementById('sidebar-overlay').classList.toggle('open')}
 
-async function loadAdmin(){showTab(currentTab)}
+async function loadAdmin(){
+  try{
+    const[tr,cr]=await Promise.all([fetch('/api/admin/teams'),fetch('/api/admin/config')]);
+    adminTeams=await tr.json();
+    adminConfig=await cr.json();
+  }catch(e){console.error(e)}
+  showTab(currentTab);
+}
 
 function showTab(tab){
   currentTab=tab;
@@ -1068,289 +1047,306 @@ function setTopbar(title,actions){document.getElementById('topbar-title').textCo
 
 // ============ IMPORT PRODUCTS ============
 async function renderImport(){
-  setTopbar('Import Products','<a href="/">${ICONS.store} View Store</a>');
+  setTopbar('Import Products');
   const c=document.getElementById('admin-content');
-  c.innerHTML='<div class="empty-state">Loading products from Lightspeed...</div>';
+  if(!adminTeams.length){
+    c.innerHTML='<div class="settings-card"><h3>No Teams Configured</h3><p style="color:#6b7280;margin-bottom:16px">Add teams in the Settings tab first, then come back here to sync their price book products.</p><button class="btn btn-primary" onclick="showTab(\\'settings\\')">Go to Settings</button></div>';
+    return;
+  }
+
+  const enabledTeams=adminTeams.filter(t=>t.enabled&&t.priceBookId);
+  if(!enabledTeams.length){
+    c.innerHTML='<div class="settings-card"><h3>No Enabled Teams</h3><p style="color:#6b7280">Enable at least one team with a Price Book ID in Settings.</p></div>';
+    return;
+  }
+
+  // Team selector
+  if(selectedTeamIdx>=enabledTeams.length)selectedTeamIdx=0;
+  const team=enabledTeams[selectedTeamIdx];
+
+  c.innerHTML='<div style="margin-bottom:16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap"><select class="filter-select" id="team-select" onchange="selectedTeamIdx=this.selectedIndex;renderImport()">'+enabledTeams.map((t,i)=>'<option'+(i===selectedTeamIdx?' selected':'')+'>'+esc(t.name)+'</option>').join('')+'</select><button class="btn btn-primary btn-sm" onclick="syncTeam(\\''+esc(team.priceBookId)+'\\',\\''+esc(team.name)+'\\')\" id="sync-btn">${ICONS.sync} Sync Price Book</button></div><div class="loading" id="import-loading">Loading products...</div>';
 
   try{
-    const r=await fetch('/api/admin/import-products');
+    const r=await fetch('/api/admin/import-products?priceBookId='+encodeURIComponent(team.priceBookId));
     const data=await r.json();
     importProducts=data.products||[];
-    syncTimestamp=data.syncTimestamp;
-    discountPercent=data.discountPercent||15;
-    renderImportTable();
+    renderImportTable(team);
   }catch(e){
-    c.innerHTML='<div class="settings-card"><h3>Lightspeed Connection</h3><p style="color:#6b7280;margin-bottom:16px">No products synced yet. Click the button below to sync products from Lightspeed.</p><button class="btn btn-primary" onclick="syncProducts()">Sync Products from Lightspeed</button></div>';
+    document.getElementById('import-loading').innerHTML='<p style="color:#dc2626">Failed to load: '+esc(e.message)+'</p>';
   }
 }
 
-function renderImportTable(){
+function renderImportTable(team){
   const c=document.getElementById('admin-content');
 
-  // Group variants by parent
+  // Group by parent
   const parentMap={};
   const standalone=[];
   for(const p of importProducts){
-    if(p.variantParentId){
-      if(!parentMap[p.variantParentId])parentMap[p.variantParentId]={parent:null,children:[]};
-      parentMap[p.variantParentId].children.push(p);
-    }else if(p.hasVariants){
-      if(!parentMap[p.id])parentMap[p.id]={parent:p,children:[]};
-      else parentMap[p.id].parent=p;
+    if(p.parentId){
+      if(!parentMap[p.parentId])parentMap[p.parentId]={products:[],name:p.name};
+      parentMap[p.parentId].products.push(p);
     }else{
       standalone.push(p);
     }
   }
 
-  // Build display list (parents + standalone)
+  // Build flat list with parent grouping
   let displayList=[];
-  for(const[id,group] of Object.entries(parentMap)){
-    const parent=group.parent||group.children[0];
-    const totalStock=group.children.reduce((s,c)=>s+(c.stock||0),0)+(parent?.stock||0);
-    const anyEnabled=group.children.some(c=>c.enabled)||(parent?.enabled||false);
-    displayList.push({
-      ...parent,
-      id:id,
-      stock:totalStock,
-      variantCount:group.children.length,
-      enabled:anyEnabled,
-      children:group.children,
-      isGroup:true
-    });
+  for(const[parentId,group] of Object.entries(parentMap)){
+    displayList.push({isParent:true,parentId,name:group.name,variantCount:group.products.length,totalStock:group.products.reduce((s,p)=>s+(p.stock||0),0),teamPrice:Math.min(...group.products.map(p=>p.teamPrice||999999)),retailPrice:Math.min(...group.products.map(p=>p.retailPrice||999999)),imageUrl:group.products.find(p=>p.imageUrl)?.imageUrl||null});
+    for(const p of group.products){
+      displayList.push({...p,isChild:true});
+    }
   }
   for(const p of standalone){
-    displayList.push({...p,isGroup:false,children:[]});
+    displayList.push(p);
   }
-
-  // Get brands for filter
-  const brands=[...new Set(displayList.map(p=>p.brand).filter(Boolean))].sort();
 
   // Filter
   let filtered=displayList;
-  if(searchQuery){const q=searchQuery.toLowerCase();filtered=filtered.filter(p=>p.name?.toLowerCase().includes(q)||p.sku?.toLowerCase().includes(q)||p.brand?.toLowerCase().includes(q))}
-  if(brandFilter)filtered=filtered.filter(p=>p.brand===brandFilter);
-  if(showEnabledOnly)filtered=filtered.filter(p=>p.enabled);
+  if(searchQuery){const q=searchQuery.toLowerCase();filtered=filtered.filter(p=>(p.name||'').toLowerCase().includes(q)||(p.sku||'').toLowerCase().includes(q)||(p.variantLabel||'').toLowerCase().includes(q)||(p.variantName||'').toLowerCase().includes(q))}
 
-  const enabledCount=displayList.filter(p=>p.enabled).length;
+  const enabledTeams=adminTeams.filter(t=>t.enabled&&t.priceBookId);
 
-  c.innerHTML=
-    '<div class="stat-cards">'+
-      '<div class="stat-card"><div class="label">Total Products</div><div class="value">'+displayList.length+'</div></div>'+
-      '<div class="stat-card"><div class="label">Enabled in Store</div><div class="value">'+enabledCount+'</div></div>'+
-      '<div class="stat-card"><div class="label">Discount</div><div class="value">'+discountPercent+'%</div></div>'+
-      '<div class="stat-card"><div class="label">Last Sync</div><div class="value" style="font-size:13px">'+(syncTimestamp?new Date(syncTimestamp).toLocaleString():'Never')+'</div></div>'+
-    '</div>'+
-    '<div class="card">'+
-      '<div class="card-header"><h3>Lightspeed Products</h3><button class="btn btn-primary btn-sm" onclick="syncProducts()" id="sync-btn">${ICONS.sync} Sync from Lightspeed</button></div>'+
-      '<div class="search-bar">'+
-        '<div class="search-input"><span class="search-icon">${ICONS.search}</span><input id="import-search" placeholder="Search by name, SKU, brand..." value="'+esc(searchQuery)+'" oninput="searchQuery=this.value;renderImportTable()"></div>'+
-        '<select class="filter-select" onchange="brandFilter=this.value;renderImportTable()"><option value="">All Brands</option>'+brands.map(b=>'<option value="'+esc(b)+'"'+(brandFilter===b?' selected':'')+'>'+esc(b)+'</option>').join('')+'</select>'+
-        '<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#6b7280;cursor:pointer;white-space:nowrap"><input type="checkbox" '+(showEnabledOnly?'checked':'')+' onchange="showEnabledOnly=this.checked;renderImportTable()" style="accent-color:#4f46e5"> Enabled only</label>'+
-      '</div>'+
-      (filtered.length===0?'<div class="empty-state">'+(importProducts.length===0?'No products synced. Click "Sync from Lightspeed" to load products.':'No products match your search.')+'</div>':
-      '<table><thead><tr><th style="width:50px">Show</th><th>Product</th><th>Brand</th><th>Variants</th><th>Stock</th><th>Retail Price</th><th>Team Price</th></tr></thead><tbody>'+
-      filtered.map(p=>{
-        const thumb=p.imageUrl?'<img src="'+esc(p.imageUrl)+'" style="width:32px;height:32px;border-radius:4px;object-fit:cover">':'<div style="width:32px;height:32px;background:#f0f1f3;border-radius:4px;display:flex;align-items:center;justify-content:center"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#c0c4cc" stroke-width="1.5"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3Z"/><circle cx="12" cy="13" r="3"/></svg></div>';
-        const teamPrice=p.teamPrice||Math.round(p.retailPrice*(1-discountPercent/100)*100)/100;
-        return '<tr>'+
-          '<td><label class="toggle"><input type="checkbox" '+(p.enabled?'checked':'')+' onchange="toggleProduct(\\''+p.id+'\\',this.checked)"><span class="toggle-slider"></span></label></td>'+
-          '<td><div class="prod-cell">'+thumb+'<div><div class="prod-name">'+esc(p.name)+'</div><div class="prod-sku">'+esc(p.sku||'')+'</div></div></div></td>'+
-          '<td style="color:#6b7280">'+esc(p.brand||'-')+'</td>'+
-          '<td>'+(p.variantCount||0)+'</td>'+
-          '<td>'+(p.stock||0)+'</td>'+
-          '<td>$'+(p.retailPrice||0).toFixed(2)+'</td>'+
-          '<td><input type="number" step="0.01" class="price-input" value="'+teamPrice.toFixed(2)+'" onchange="updateTeamPrice(\\''+p.id+'\\',this.value)" '+(p.enabled?'':'disabled')+' id="price-'+p.id+'"></td>'+
-        '</tr>';
-      }).join('')+'</tbody></table>')+
-    '</div>';
+  // Stats
+  const totalItems=importProducts.length;
+  const totalStock=importProducts.reduce((s,p)=>s+(p.stock||0),0);
+  const parentCount=Object.keys(parentMap).length+standalone.length;
+
+  let html='<div class="stat-cards">'+
+    '<div class="stat-card"><div class="label">Price Book Items</div><div class="value">'+totalItems+'</div></div>'+
+    '<div class="stat-card"><div class="label">Products</div><div class="value">'+parentCount+'</div></div>'+
+    '<div class="stat-card"><div class="label">Total Stock</div><div class="value">'+totalStock+'</div></div>'+
+  '</div>';
+
+  html+='<div style="margin-bottom:16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap"><select class="filter-select" id="team-select" onchange="selectedTeamIdx=this.selectedIndex;renderImport()">'+enabledTeams.map((t,i)=>'<option'+(i===selectedTeamIdx?' selected':'')+'>'+esc(t.name)+'</option>').join('')+'</select><button class="btn btn-primary btn-sm" onclick="syncTeam(\\''+esc(team.priceBookId)+'\\',\\''+esc(team.name)+'\\')\" id="sync-btn">${ICONS.sync} Sync Price Book</button></div>';
+
+  html+='<div class="card"><div class="card-header"><h3>'+esc(team.name)+' - Price Book Products</h3></div>';
+  html+='<div class="search-bar"><div class="search-input"><span class="search-icon">${ICONS.search}</span><input id="import-search" placeholder="Search by name, SKU, variant..." value="'+esc(searchQuery)+'" oninput="searchQuery=this.value;renderImportTable(adminTeams.filter(t=>t.enabled&&t.priceBookId)[selectedTeamIdx])"></div></div>';
+
+  if(filtered.length===0){
+    html+='<div class="empty-state">'+(importProducts.length===0?'No products in this price book. Click "Sync Price Book" to load.':'No products match your search.')+'</div>';
+  }else{
+    html+='<div style="overflow-x:auto"><table><thead><tr><th>Product</th><th>Variant</th><th>SKU</th><th>Retail</th><th>Team Price</th><th>Stock</th></tr></thead><tbody>';
+    for(const p of filtered){
+      if(p.isParent){
+        html+='<tr style="background:#f5f3ff"><td colspan="3"><strong>'+esc(p.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+p.variantCount+' variants)</span></td><td style="color:#9ca3af;font-size:12px">from $'+(p.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600">from $'+(p.teamPrice||0).toFixed(2)+'</td><td>'+p.totalStock+'</td></tr>';
+      }else{
+        const indent=p.isChild?'padding-left:32px':'';
+        const thumb=p.imageUrl?'<img src="'+esc(p.imageUrl)+'" style="width:28px;height:28px;border-radius:3px;object-fit:cover">':'';
+        html+='<tr><td style="'+indent+'"><div class="prod-cell">'+(thumb?'<div class="prod-thumb">'+thumb+'</div>':'')+'<div class="prod-name">'+esc(p.isChild?'':p.name)+'</div></div></td><td style="color:#6b7280;font-size:12px">'+esc(p.variantLabel||p.variantName||'-')+'</td><td style="color:#6b7280;font-size:12px">'+esc(p.sku||'-')+'</td><td>$'+(p.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600;color:#4f46e5">$'+(p.teamPrice||0).toFixed(2)+'</td><td>'+(p.stock>0?'<span class="badge-status badge-success">'+p.stock+'</span>':'<span class="badge-status badge-info">0</span>')+'</td></tr>';
+      }
+    }
+    html+='</tbody></table></div>';
+  }
+  html+='</div>';
+  c.innerHTML=html;
 }
 
-async function syncProducts(){
+async function syncTeam(priceBookId,teamName){
   const btn=document.getElementById('sync-btn');
   if(btn){btn.disabled=true;btn.innerHTML='Syncing...';}
   try{
-    const r=await fetch('/api/admin/lightspeed/sync');
+    const r=await fetch('/api/admin/lightspeed/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({priceBookId})});
     const data=await r.json();
     if(data.success){
-      showToast('Synced '+data.totalProducts+' products from Lightspeed');
+      showToast('Synced '+data.totalProducts+' products for '+teamName);
       renderImport();
-    }else{
-      showToast('Sync failed: '+(data.error||'Unknown error'));
-    }
+    }else{showToast('Sync failed: '+(data.error||'Unknown error'))}
   }catch(e){showToast('Sync failed: '+e.message)}
-  finally{if(btn){btn.disabled=false;btn.innerHTML=IC.sync+' Sync from Lightspeed'}}
+  finally{if(btn){btn.disabled=false;btn.innerHTML=IC.sync+' Sync Price Book'}}
 }
 
-async function toggleProduct(productId,enabled){
+// ============ PRODUCTS ============
+async function renderProducts(){
+  setTopbar('Products');
+  const c=document.getElementById('admin-content');
+  c.innerHTML='<div class="loading">Loading products across all teams...</div>';
   try{
-    // If this is a group (parent with variants), toggle all children too
-    const parent=importProducts.find(p=>p.id===productId);
-    const children=importProducts.filter(p=>p.variantParentId===productId);
+    const r=await fetch('/api/admin/products');
+    allProducts=await r.json();
+  }catch(e){allProducts=[];}
 
-    // Toggle parent
-    await fetch('/api/admin/lightspeed/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({productId,enabled})});
+  // Group by team
+  const byTeam={};
+  for(const p of allProducts){
+    const k=p.teamName||'Unknown';
+    if(!byTeam[k])byTeam[k]=[];
+    byTeam[k].push(p);
+  }
 
-    // Toggle all children
-    for(const child of children){
-      await fetch('/api/admin/lightspeed/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({productId:child.id,enabled})});
+  let html='<div class="stat-cards"><div class="stat-card"><div class="label">Total Items</div><div class="value">'+allProducts.length+'</div></div><div class="stat-card"><div class="label">Teams</div><div class="value">'+Object.keys(byTeam).length+'</div></div></div>';
+
+  for(const[teamName,prods] of Object.entries(byTeam)){
+    // Group by parent within each team
+    const parents={};
+    const standaloneP=[];
+    for(const p of prods){
+      if(p.parentId){
+        if(!parents[p.parentId])parents[p.parentId]={name:p.name,items:[]};
+        parents[p.parentId].items.push(p);
+      }else standaloneP.push(p);
     }
 
-    // Update local state
-    const updateLocal=(id)=>{const p=importProducts.find(x=>x.id===id);if(p)p.enabled=enabled};
-    updateLocal(productId);
-    children.forEach(c=>updateLocal(c.id));
+    html+='<div class="card"><div class="card-header"><h3>'+esc(teamName)+'</h3><span class="badge-status badge-info">'+prods.length+' items</span></div><div style="overflow-x:auto"><table><thead><tr><th>Product</th><th>Variant</th><th>SKU</th><th>Team Price</th><th>Retail</th><th>Stock</th></tr></thead><tbody>';
 
-    // Enable/disable price input
-    const priceInput=document.getElementById('price-'+productId);
-    if(priceInput)priceInput.disabled=!enabled;
-
-    showToast(enabled?'Product enabled in team store':'Product removed from team store');
-  }catch(e){showToast('Error: '+e.message)}
-}
-
-async function updateTeamPrice(productId,value){
-  const price=parseFloat(value);
-  if(isNaN(price)||price<0){showToast('Invalid price');return}
-  try{
-    // Update parent
-    await fetch('/api/admin/lightspeed/price',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({productId,teamPrice:price})});
-
-    // Also update children
-    const children=importProducts.filter(p=>p.variantParentId===productId);
-    for(const child of children){
-      if(child.enabled){
-        await fetch('/api/admin/lightspeed/price',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({productId:child.id,teamPrice:price})});
+    for(const[pid,group] of Object.entries(parents)){
+      html+='<tr style="background:#f5f3ff"><td colspan="6"><strong>'+esc(group.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+group.items.length+' variants)</span></td></tr>';
+      for(const p of group.items){
+        html+='<tr><td style="padding-left:32px"></td><td style="color:#6b7280;font-size:12px">'+esc(p.variantLabel||'-')+'</td><td style="color:#6b7280;font-size:12px">'+esc(p.sku||'-')+'</td><td style="font-weight:600;color:#4f46e5">$'+(p.teamPrice||0).toFixed(2)+'</td><td style="color:#9ca3af">$'+(p.retailPrice||0).toFixed(2)+'</td><td>'+(p.stock||0)+'</td></tr>';
       }
     }
+    for(const p of standaloneP){
+      html+='<tr><td><div class="prod-name">'+esc(p.name)+'</div></td><td>-</td><td style="color:#6b7280;font-size:12px">'+esc(p.sku||'-')+'</td><td style="font-weight:600;color:#4f46e5">$'+(p.teamPrice||0).toFixed(2)+'</td><td style="color:#9ca3af">$'+(p.retailPrice||0).toFixed(2)+'</td><td>'+(p.stock||0)+'</td></tr>';
+    }
 
-    showToast('Team price updated');
-  }catch(e){showToast('Error: '+e.message)}
-}
+    html+='</tbody></table></div></div>';
+  }
 
-// ============ PRODUCTS (enabled list) ============
-async function renderProducts(){
-  setTopbar('Enabled Products');
-  const c=document.getElementById('admin-content');
-  c.innerHTML='<div class="empty-state">Loading...</div>';
-  try{
-    const r=await fetch('/api/admin/enabled-products');
-    enabledProducts=await r.json();
-    c.innerHTML='<div class="card"><div class="card-header"><h3>Team Store Products</h3><span style="font-size:12px;color:#6b7280">'+enabledProducts.length+' product(s) enabled</span></div>'+
-      (enabledProducts.length===0?'<div class="empty-state">No products enabled yet. Go to Import Products to add products from Lightspeed.</div>':
-      '<table><thead><tr><th>Product</th><th>Brand</th><th>SKU</th><th>Retail</th><th>Team Price</th><th>Stock</th></tr></thead><tbody>'+
-      enabledProducts.map(p=>{
-        const thumb=p.imageUrl?'<img src="'+esc(p.imageUrl)+'" style="width:32px;height:32px;border-radius:4px;object-fit:cover">':'';
-        return '<tr><td><div class="prod-cell">'+(thumb||'')+'<div class="prod-name">'+esc(p.name)+'</div></div></td><td style="color:#6b7280">'+esc(p.brand||'-')+'</td><td style="color:#6b7280;font-size:11px">'+esc(p.sku||'-')+'</td><td>$'+(p.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600;color:#16a34a">$'+(p.teamPrice||0).toFixed(2)+'</td><td>'+(p.stock||0)+'</td></tr>';
-      }).join('')+'</tbody></table>')+
-    '</div>';
-  }catch(e){c.innerHTML='<div class="empty-state">Error loading products</div>'}
+  if(!allProducts.length) html+='<div class="empty-state">No products synced yet. Go to Import Products to sync a team\\'s price book.</div>';
+  html+='<p style="color:#6b7280;font-size:12px;text-align:center;margin-top:8px">Product prices and availability are managed in Lightspeed POS.</p>';
+  c.innerHTML=html;
 }
 
 // ============ ORDERS ============
-async function renderOrders(detailId){
+async function renderOrders(){
   setTopbar('Recent Orders');
   const c=document.getElementById('admin-content');
-  c.innerHTML='<div class="empty-state">Loading...</div>';
+  c.innerHTML='<div class="loading">Loading orders...</div>';
   try{
     const r=await fetch('/api/admin/orders');
     adminOrders=await r.json();
-  }catch(e){adminOrders=[]}
+  }catch(e){adminOrders=[];}
 
-  if(detailId)return renderOrderDetail(detailId);
+  if(!adminOrders.length){c.innerHTML='<div class="empty-state">No orders yet.</div>';return}
 
-  const c2=document.getElementById('admin-content');
-  c2.innerHTML='<div class="card"><div class="card-header"><h3>Recent Orders</h3><span style="font-size:12px;color:#6b7280">Manage fulfillment in Lightspeed POS</span></div>'+
-    (adminOrders.length===0?'<div class="empty-state">No orders yet</div>':
-    '<table><thead><tr><th>Order</th><th>Customer</th><th>Date</th><th>Items</th><th>Total</th><th>Lightspeed</th></tr></thead><tbody>'+
-    adminOrders.map(o=>{
-      const d=new Date(o.createdAt).toLocaleDateString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
-      const ic=(o.items||[]).reduce((s,i)=>s+(i.qty||1),0);
-      const lsStatus=o.lightspeedSaleId?'<span class="badge-status badge-success">Synced</span>':(o.lightspeedSyncFailed?'<span class="badge-status badge-error">Failed</span>':'<span class="badge-status badge-warning">Pending</span>');
-      return '<tr style="cursor:pointer" onclick="renderOrders(\\''+o.id+'\\')"><td style="font-weight:600;color:#4f46e5">#'+o.id.slice(-6).toUpperCase()+'</td><td>'+esc(o.customer?.name||'-')+'</td><td style="color:#6b7280">'+d+'</td><td>'+ic+'</td><td style="font-weight:600">$'+(o.total||0).toFixed(2)+'</td><td>'+lsStatus+'</td></tr>';
-    }).join('')+'</tbody></table>')+
-  '</div>';
-}
-
-function renderOrderDetail(orderId){
-  const o=adminOrders.find(x=>x.id===orderId);
-  if(!o)return;
-  setTopbar('Order #'+o.id.slice(-6).toUpperCase());
-  const c=document.getElementById('admin-content');
-  const d=new Date(o.createdAt).toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'});
-  c.innerHTML='<a class="back-link" onclick="renderOrders()">${ICONS.back} Back to Orders</a>'+
-    '<div class="card"><div style="padding:20px 24px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between"><span style="font-size:18px;font-weight:700">#'+o.id.slice(-6).toUpperCase()+'</span>'+
-    (o.lightspeedSaleId?'<span class="badge-status badge-success">Synced to Lightspeed</span>':(o.lightspeedSyncFailed?'<span class="badge-status badge-error">Lightspeed sync failed</span>':'<span class="badge-status badge-warning">Processing</span>'))+
-    '</div>'+
-    '<div class="od-info"><div class="od-info-item"><label>Customer</label><span>'+esc(o.customer?.name||'-')+'</span></div><div class="od-info-item"><label>Email</label><span>'+esc(o.customer?.email||'-')+'</span></div><div class="od-info-item"><label>Phone</label><span>'+esc(o.customer?.phone||'-')+'</span></div></div>'+
-    '<div class="od-info"><div class="od-info-item"><label>Order Date</label><span>'+d+'</span></div><div class="od-info-item"><label>Lightspeed Sale</label><span style="font-size:12px;color:#6b7280">'+(o.lightspeedSaleId||'N/A')+'</span></div><div class="od-info-item"><label>Stripe PI</label><span style="font-size:12px;color:#6b7280">'+(o.stripePaymentIntent||'-')+'</span></div></div>'+
-    '<div style="padding:0 24px"><table><thead><tr><th>Product</th><th>Variant</th><th>Qty</th><th>Price</th><th>Total</th></tr></thead><tbody>'+
-    (o.items||[]).map(item=>'<tr><td style="font-weight:500">'+esc(item.name||'Product')+'</td><td style="color:#6b7280;font-size:12px">'+esc(item.variantName||'-')+'</td><td>'+item.qty+'</td><td>$'+((item.teamPrice||item.price||0)).toFixed(2)+'</td><td style="font-weight:600">$'+((item.teamPrice||item.price||0)*item.qty).toFixed(2)+'</td></tr>').join('')+
-    '</tbody></table></div>'+
-    '<div style="padding:16px 24px;border-top:1px solid #e5e7eb;display:flex;justify-content:flex-end;gap:24px;font-weight:600"><span>Total</span><span style="font-size:18px">$'+(o.total||0).toFixed(2)+'</span></div>'+
-    '<div style="padding:16px 24px;border-top:1px solid #e5e7eb;color:#6b7280;font-size:13px">Manage order fulfillment in Lightspeed POS</div>'+
-  '</div>';
+  let html='<div class="card"><div class="card-header"><h3>Recent Orders</h3><span style="color:#6b7280;font-size:12px">Manage orders in Lightspeed POS</span></div><div style="overflow-x:auto"><table><thead><tr><th>Order</th><th>Team</th><th>Customer</th><th>Items</th><th>Total</th><th>Lightspeed</th><th>Date</th></tr></thead><tbody>';
+  for(const o of adminOrders){
+    const num=o.id.slice(-6).toUpperCase();
+    const lsStatus=o.lightspeedSaleId?'<span class="badge-status badge-success">Synced</span>':(o.lightspeedSyncFailed?'<span class="badge-status badge-error">Failed</span>':'<span class="badge-status badge-warning">Pending</span>');
+    html+='<tr><td style="font-weight:600">#'+num+'</td><td>'+esc(o.teamName||'-')+'</td><td><div>'+esc(o.customer?.name||'-')+'</div><div style="font-size:11px;color:#6b7280">'+esc(o.customer?.email||'')+'</div></td><td>'+(o.items?.length||0)+'</td><td style="font-weight:600">$'+(o.total||0).toFixed(2)+'</td><td>'+lsStatus+'</td><td style="color:#6b7280;font-size:12px">'+new Date(o.createdAt).toLocaleDateString()+'</td></tr>';
+  }
+  html+='</tbody></table></div></div>';
+  c.innerHTML=html;
 }
 
 // ============ SETTINGS ============
-function renderSettings(){
+async function renderSettings(){
   setTopbar('Settings');
   const c=document.getElementById('admin-content');
-  c.innerHTML='<div id="settings-content">Loading...</div>';
-  loadSettings();
+
+  let html='';
+
+  // Store Config
+  html+='<div class="settings-card"><h3>Store Configuration</h3><div class="fg-row"><div class="fg"><label>Store Name</label><input id="cfg-store-name" value="'+esc(adminConfig.storeName||'Ice Lab Team Store')+'"></div><div class="fg"><label>Admin PIN</label><input id="cfg-admin-pin" value="'+esc(adminConfig.adminPin||'9999')+'" maxlength="4"></div></div><button class="btn btn-primary btn-sm" onclick="saveConfig()" style="margin-top:8px">Save Configuration</button></div>';
+
+  // Teams
+  html+='<div class="settings-card"><h3>Teams Management</h3><p style="color:#6b7280;font-size:13px;margin-bottom:16px">Each team has its own PIN and Lightspeed Price Book for team-specific pricing.</p><div id="teams-list">';
+  for(let i=0;i<adminTeams.length;i++){
+    const t=adminTeams[i];
+    html+=teamRowHtml(i,t);
+  }
+  html+='</div><button class="btn btn-outline btn-sm" onclick="addTeam()" style="margin-top:8px">${ICONS.plus} Add Team</button><div style="margin-top:12px"><button class="btn btn-primary btn-sm" onclick="saveTeams()">Save Teams</button></div></div>';
+
+  // Lightspeed
+  html+='<div class="settings-card"><h3>Lightspeed Integration</h3><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-outline btn-sm" onclick="testLightspeed()">Test Connection</button><button class="btn btn-primary btn-sm" onclick="fullSync()">Full Sync All Teams</button></div><div id="ls-status" style="margin-top:12px;font-size:13px;color:#6b7280"></div></div>';
+
+  // Stripe
+  html+='<div class="settings-card"><h3>Stripe Integration</h3><div class="fg"><label>Publishable Key</label><input id="cfg-stripe-pk" value="'+esc(adminConfig.stripePublishableKey||'')+'" placeholder="pk_..."></div><div class="fg"><label>Secret Key</label><input id="cfg-stripe-sk" value="'+esc(adminConfig.stripeSecretKey||'')+'" placeholder="sk_..." type="password"></div><div class="fg"><label>Webhook Secret</label><input id="cfg-stripe-wh" value="'+esc(adminConfig.stripeWebhookSecret||'')+'" placeholder="whsec_..." type="password"></div><button class="btn btn-primary btn-sm" onclick="saveStripe()">Save Stripe Settings</button></div>';
+
+  c.innerHTML=html;
 }
 
-async function loadSettings(){
-  const r=await fetch('/api/admin/config');
-  const config=await r.json();
-  document.getElementById('settings-content').innerHTML=
-    '<div class="settings-card"><h3>Store Configuration</h3>'+
-      '<div class="fg"><label>Store Name</label><input id="sf-name" value="'+esc(config.storeName||'')+'"></div>'+
-      '<div class="fg-row"><div class="fg"><label>Store PIN (customer access)</label><input id="sf-pin" value="'+esc(config.storePin||'')+'"></div><div class="fg"><label>Admin PIN</label><input id="sf-admin-pin" value="'+esc(config.adminPin||'')+'"></div></div>'+
-      '<button class="btn btn-primary" onclick="saveSettings(\\'store\\')">Save Store Settings</button>'+
-    '</div>'+
+function teamRowHtml(i,t){
+  return '<div class="team-row" id="team-row-'+i+'"><div class="fg wide"><label>Team Name</label><input id="team-name-'+i+'" value="'+esc(t.name||'')+'" placeholder="Lynn University Hockey"></div><div class="fg narrow"><label>Slug</label><input id="team-slug-'+i+'" value="'+esc(t.slug||'')+'" placeholder="lynn"></div><div class="fg narrow"><label>PIN</label><input id="team-pin-'+i+'" value="'+esc(t.pin||'')+'" maxlength="4" placeholder="1234"></div><div class="fg wide"><label>Price Book ID</label><input id="team-pb-'+i+'" value="'+esc(t.priceBookId||'')+'" placeholder="UUID from Lightspeed"></div><div class="fg"><label>Logo URL</label><input id="team-logo-'+i+'" value="'+esc(t.logoUrl||'')+'" placeholder="https://..."></div><div style="display:flex;align-items:center;gap:8px;padding-bottom:4px"><label class="toggle"><input type="checkbox" id="team-enabled-'+i+'"'+(t.enabled?' checked':'')+'><span class="toggle-slider"></span></label><button class="btn btn-danger btn-sm" onclick="removeTeam('+i+')" title="Remove">${ICONS.trash}</button></div></div>';
+}
 
-    '<div class="settings-card"><h3>Lightspeed Integration</h3>'+
-      '<div class="fg"><label>Team Discount %</label><input id="sf-discount" type="number" value="'+(config.discountPercent||15)+'" min="0" max="100"></div>'+
-      '<div style="display:flex;gap:8px;margin-bottom:16px"><button class="btn btn-outline btn-sm" onclick="testLightspeed()" id="test-ls-btn">${ICONS.link} Test Connection</button><button class="btn btn-primary btn-sm" onclick="syncProducts()" id="sync-ls-btn">${ICONS.sync} Sync Products</button></div>'+
-      '<div id="ls-test-result"></div>'+
-      '<p style="font-size:12px;color:#6b7280;margin-top:8px">API token and domain prefix are set via wrangler secrets (LIGHTSPEED_API_TOKEN, LIGHTSPEED_DOMAIN_PREFIX).</p>'+
-      '<p style="font-size:12px;color:#6b7280;margin-top:4px">Last sync: '+(syncTimestamp?new Date(syncTimestamp).toLocaleString():'Never')+'</p>'+
-      '<p style="font-size:12px;color:#6b7280;margin-top:4px">Auto-sync runs every 30 minutes via cron trigger.</p>'+
-      '<button class="btn btn-primary" onclick="saveSettings(\\'lightspeed\\')">Save Lightspeed Settings</button>'+
-    '</div>'+
+function addTeam(){
+  adminTeams.push({name:'',slug:'',pin:'',priceBookId:'',logoUrl:'',enabled:true});
+  const list=document.getElementById('teams-list');
+  const i=adminTeams.length-1;
+  list.insertAdjacentHTML('beforeend',teamRowHtml(i,adminTeams[i]));
+}
 
-    '<div class="settings-card"><h3>Payment Configuration</h3>'+
-      '<div class="fg"><label>Stripe Publishable Key</label><input id="sf-stripe-pk" value="'+esc(config.stripePublishableKey||'')+'"></div>'+
-      '<div class="fg"><label>Stripe Secret Key</label><input id="sf-stripe-sk" type="password" value="'+esc(config.stripeSecretKey||'')+'"></div>'+
-      '<div class="fg"><label>Stripe Webhook Secret</label><input id="sf-stripe-wh" type="password" value="'+esc(config.stripeWebhookSecret||'')+'"></div>'+
-      '<button class="btn btn-primary" onclick="saveSettings(\\'payment\\')">Save Payment Settings</button>'+
-    '</div>';
+function removeTeam(i){
+  adminTeams.splice(i,1);
+  renderSettings();
+}
+
+function readTeamsFromForm(){
+  const teams=[];
+  for(let i=0;i<adminTeams.length;i++){
+    const nameEl=document.getElementById('team-name-'+i);
+    if(!nameEl)continue;
+    teams.push({
+      name:nameEl.value.trim(),
+      slug:document.getElementById('team-slug-'+i).value.trim().toLowerCase().replace(/[^a-z0-9-]/g,''),
+      pin:document.getElementById('team-pin-'+i).value.trim(),
+      priceBookId:document.getElementById('team-pb-'+i).value.trim(),
+      logoUrl:document.getElementById('team-logo-'+i).value.trim(),
+      enabled:document.getElementById('team-enabled-'+i).checked
+    });
+  }
+  return teams.filter(t=>t.name);
+}
+
+async function saveTeams(){
+  const teams=readTeamsFromForm();
+  try{
+    const r=await fetch('/api/admin/teams',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({teams})});
+    if(r.ok){adminTeams=teams;showToast('Teams saved')}
+    else showToast('Save failed');
+  }catch(e){showToast('Error: '+e.message)}
+}
+
+async function saveConfig(){
+  const data={
+    storeName:document.getElementById('cfg-store-name').value.trim()||'Ice Lab Team Store',
+    adminPin:document.getElementById('cfg-admin-pin').value.trim()||'9999'
+  };
+  try{
+    const r=await fetch('/api/admin/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    if(r.ok){adminConfig={...adminConfig,...data};showToast('Configuration saved')}
+    else showToast('Save failed');
+  }catch(e){showToast('Error: '+e.message)}
+}
+
+async function saveStripe(){
+  const data={
+    stripePublishableKey:document.getElementById('cfg-stripe-pk').value.trim(),
+    stripeSecretKey:document.getElementById('cfg-stripe-sk').value.trim(),
+    stripeWebhookSecret:document.getElementById('cfg-stripe-wh').value.trim()
+  };
+  try{
+    const r=await fetch('/api/admin/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    if(r.ok){adminConfig={...adminConfig,...data};showToast('Stripe settings saved')}
+    else showToast('Save failed');
+  }catch(e){showToast('Error: '+e.message)}
 }
 
 async function testLightspeed(){
-  const btn=document.getElementById('test-ls-btn');
-  const result=document.getElementById('ls-test-result');
-  btn.disabled=true;btn.textContent='Testing...';
+  const el=document.getElementById('ls-status');
+  el.innerHTML='Testing connection...';
   try{
     const r=await fetch('/api/admin/lightspeed/test');
     const data=await r.json();
-    if(data.success){result.innerHTML='<span class="badge-status badge-success">'+esc(data.message)+'</span>'}
-    else{result.innerHTML='<span class="badge-status badge-error">'+esc(data.error)+'</span>'}
-  }catch(e){result.innerHTML='<span class="badge-status badge-error">Connection error</span>'}
-  finally{btn.disabled=false;btn.innerHTML=IC.link+' Test Connection'}
+    if(data.success){el.innerHTML='<span style="color:#16a34a">'+esc(data.message)+'</span>'}
+    else{el.innerHTML='<span style="color:#dc2626">'+esc(data.error||'Connection failed')+'</span>'}
+  }catch(e){el.innerHTML='<span style="color:#dc2626">Error: '+esc(e.message)+'</span>'}
 }
 
-async function saveSettings(section){
-  let config={};
-  if(section==='store'){
-    config={storeName:document.getElementById('sf-name').value.trim(),storePin:document.getElementById('sf-pin').value.trim(),adminPin:document.getElementById('sf-admin-pin').value.trim()};
-  }else if(section==='lightspeed'){
-    config={discountPercent:parseInt(document.getElementById('sf-discount').value)||15};
-  }else{
-    config={stripePublishableKey:document.getElementById('sf-stripe-pk').value.trim(),stripeSecretKey:document.getElementById('sf-stripe-sk').value.trim(),stripeWebhookSecret:document.getElementById('sf-stripe-wh').value.trim()};
-  }
-  await fetch('/api/admin/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(config)});
-  showToast('Settings saved');
+async function fullSync(){
+  const el=document.getElementById('ls-status');
+  el.innerHTML='Syncing all teams...';
+  try{
+    const r=await fetch('/api/admin/lightspeed/sync-all',{method:'POST'});
+    const data=await r.json();
+    if(data.success){
+      const summary=data.results.map(r=>r.team+': '+(r.success?r.products+' products':'FAILED - '+r.error)).join(', ');
+      el.innerHTML='<span style="color:#16a34a">Sync complete. '+esc(summary)+'</span>';
+    }else{el.innerHTML='<span style="color:#dc2626">'+esc(data.error||'Sync failed')+'</span>'}
+  }catch(e){el.innerHTML='<span style="color:#dc2626">Error: '+esc(e.message)+'</span>'}
 }
 
 function showToast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500)}
