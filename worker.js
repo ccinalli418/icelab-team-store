@@ -29,6 +29,7 @@ export default {
         if (path === '/api/admin/config' && method === 'POST') return apiAdminSaveConfig(request, env);
         if (path === '/api/admin/teams' && method === 'GET') return apiAdminGetTeams(env);
         if (path === '/api/admin/teams' && method === 'POST') return apiAdminSaveTeams(request, env);
+        if (path === '/api/admin/test-order' && method === 'POST') return apiTestOrder(request, env);
         return json({ error: 'Not found' }, 404);
       } catch (e) {
         console.error('API Error:', e.message, e.stack);
@@ -506,6 +507,139 @@ async function verifyStripeSignature(payload, sigHeader, secret) {
 // ============================================================
 // LIGHTSPEED SALE CREATION
 // ============================================================
+// ============================================================
+// TEST ORDER — simulates full Lightspeed sale creation step by step
+// ============================================================
+async function apiTestOrder(request, env) {
+  const body = await request.json();
+  const steps = [];
+  let customerId = null;
+  let registerId = null;
+  let userId = null;
+  let paymentTypeId = null;
+  let saleId = null;
+
+  const testCustomer = {
+    name: body.name || 'Test Customer',
+    email: body.email || 'test@icelabproshop.com',
+    phone: body.phone || '555-0100'
+  };
+
+  // Get a real product from the first enabled team's price book
+  const teams = await getTeams(env);
+  const team = teams.find(t => t.enabled && t.priceBookId);
+  if (!team) return json({ error: 'No enabled team configured' }, 400);
+
+  const products = await getPriceBookProducts(env, team.priceBookId);
+  if (!products.length) return json({ error: 'No products in price book. Sync first.' }, 400);
+  const testProduct = products[0];
+
+  // STEP 1: Search for existing customer
+  try {
+    const custSearch = await lsFetch(env, `customers?email=${encodeURIComponent(testCustomer.email)}`);
+    const customers = custSearch.customers || custSearch.data || [];
+    if (customers.length > 0) {
+      customerId = customers[0].id;
+      steps.push({ step: 1, action: 'Search customer by email', status: 'found', detail: { id: customerId, name: `${customers[0].first_name} ${customers[0].last_name}`, email: customers[0].email } });
+    } else {
+      steps.push({ step: 1, action: 'Search customer by email', status: 'not_found', detail: { email: testCustomer.email } });
+    }
+  } catch (e) {
+    steps.push({ step: 1, action: 'Search customer by email', status: 'error', detail: e.message });
+  }
+
+  // STEP 2: Create customer if not found
+  if (!customerId) {
+    try {
+      const nameParts = testCustomer.name.split(' ');
+      const payload = { first_name: nameParts[0] || '', last_name: nameParts.slice(1).join(' ') || '', email: testCustomer.email, phone: testCustomer.phone };
+      steps.push({ step: 2, action: 'Create customer', status: 'sending', detail: { payload } });
+      const newCust = await lsFetch(env, 'customers', { method: 'POST', body: JSON.stringify(payload) });
+      const custData = newCust.data || newCust.customer || newCust;
+      customerId = custData.id;
+      steps.push({ step: 2, action: 'Create customer', status: 'created', detail: { id: customerId, response: { id: custData.id, first_name: custData.first_name, last_name: custData.last_name, email: custData.email, phone: custData.phone } } });
+    } catch (e) {
+      steps.push({ step: 2, action: 'Create customer', status: 'error', detail: e.message });
+    }
+  }
+
+  // STEP 3: Get register
+  try {
+    const registersData = await lsFetch(env, 'registers');
+    const registers = registersData.registers || registersData.data || [];
+    steps.push({ step: 3, action: 'Fetch registers', status: 'ok', detail: registers.map(r => ({ id: r.id, name: r.name })) });
+    if (registers.length) registerId = registers[0].id;
+  } catch (e) {
+    steps.push({ step: 3, action: 'Fetch registers', status: 'error', detail: e.message });
+  }
+
+  // STEP 4: Get user
+  try {
+    const usersData = await lsFetch(env, 'users');
+    const users = usersData.users || usersData.data || [];
+    steps.push({ step: 4, action: 'Fetch users', status: 'ok', detail: users.map(u => ({ id: u.id, name: u.display_name || u.name || u.email })) });
+    if (users.length) userId = users[0].id;
+  } catch (e) {
+    steps.push({ step: 4, action: 'Fetch users', status: 'error', detail: e.message });
+  }
+
+  // STEP 5: Get payment types
+  try {
+    const ptData = await lsFetch(env, 'payment_types');
+    const paymentTypes = ptData.payment_types || ptData.data || [];
+    steps.push({ step: 5, action: 'Fetch payment types', status: 'ok', detail: paymentTypes.map(pt => ({ id: pt.id, name: pt.name })) });
+    const onAccount = paymentTypes.find(pt => pt.name?.toLowerCase().includes('account') || pt.name?.toLowerCase().includes('layby'));
+    paymentTypeId = onAccount?.id || paymentTypes[0]?.id;
+  } catch (e) {
+    steps.push({ step: 5, action: 'Fetch payment types', status: 'error', detail: e.message });
+  }
+
+  // STEP 6: Build sale payload (show it but don't send unless confirmed)
+  const salePayload = {
+    register_id: registerId,
+    user_id: userId,
+    customer_id: customerId,
+    status: 'on_account',
+    note: `TEST ORDER - ${team.name} | Test from Team Store Admin`,
+    register_sale_products: [{
+      product_id: testProduct.lightspeedProductId,
+      quantity: 1,
+      price: testProduct.teamPrice,
+      tax: 0
+    }]
+  };
+  if (paymentTypeId) {
+    salePayload.register_sale_payments = [{ payment_type_id: paymentTypeId, amount: testProduct.teamPrice }];
+  }
+
+  steps.push({ step: 6, action: 'Build sale payload', status: 'ready', detail: {
+    payload: salePayload,
+    productUsed: { name: testProduct.variantName || testProduct.name, sku: testProduct.sku, teamPrice: testProduct.teamPrice }
+  }});
+
+  // STEP 7: Create sale (only if body.confirm === true)
+  if (body.confirm) {
+    try {
+      const saleResp = await lsFetch(env, 'register_sales', { method: 'POST', body: JSON.stringify(salePayload) });
+      const sale = saleResp.register_sale || saleResp.data || saleResp;
+      saleId = sale.id;
+      steps.push({ step: 7, action: 'Create sale in Lightspeed', status: 'created', detail: {
+        id: sale.id,
+        receipt_number: sale.receipt_number,
+        status: sale.status,
+        total: sale.total_price || sale.totals?.total_payment,
+        customer_id: sale.customer_id
+      }});
+    } catch (e) {
+      steps.push({ step: 7, action: 'Create sale in Lightspeed', status: 'error', detail: e.message });
+    }
+  } else {
+    steps.push({ step: 7, action: 'Create sale in Lightspeed', status: 'skipped', detail: 'Send with "confirm": true to actually create the sale' });
+  }
+
+  return json({ steps, customer: testCustomer, teamName: team.name, saleId });
+}
+
 async function createLightspeedSale(env, order) {
   const registersData = await lsFetch(env, 'registers');
   const registers = registersData.registers || registersData.data || [];
@@ -1210,26 +1344,31 @@ async function renderProducts(){
   let html='<div class="stat-cards"><div class="stat-card"><div class="label">Total Items</div><div class="value">'+allProducts.length+'</div></div><div class="stat-card"><div class="label">Teams</div><div class="value">'+Object.keys(byTeam).length+'</div></div></div>';
 
   for(const[teamName,prods] of Object.entries(byTeam)){
-    // Group by parent within each team
+    // Two-pass grouping: first collect parentIds from children, then filter standalones
     const parents={};
-    const standaloneP=[];
+    const childProds=[];
+    const parentProds=[];
     for(const p of prods){
-      if(p.parentId){
-        if(!parents[p.parentId])parents[p.parentId]={name:p.name,items:[]};
-        parents[p.parentId].items.push(p);
-      }else standaloneP.push(p);
+      if(p.parentId){childProds.push(p);if(!parents[p.parentId])parents[p.parentId]={name:p.name,items:[]};}
+      else parentProds.push(p);
     }
+    for(const p of childProds){parents[p.parentId].items.push(p);}
+    const standaloneP=parentProds.filter(p=>!parents[p.lightspeedProductId]);
+    const groupCount=Object.keys(parents).length+standaloneP.length;
 
-    html+='<div class="card"><div class="card-header"><h3>'+esc(teamName)+'</h3><span class="badge-status badge-info">'+prods.length+' items</span></div><div style="overflow-x:auto"><table><thead><tr><th>Product</th><th>Variant</th><th>SKU</th><th>Team Price</th><th>Retail</th><th>Stock</th></tr></thead><tbody>';
+    html+='<div class="card"><div class="card-header"><h3>'+esc(teamName)+'</h3><span class="badge-status badge-info">'+groupCount+' products ('+prods.length+' items)</span></div><div style="overflow-x:auto"><table><thead><tr><th style="width:30px"></th><th>Product</th><th>SKU</th><th>Team Price</th><th>Retail</th><th>Stock</th></tr></thead><tbody>';
 
     for(const[pid,group] of Object.entries(parents)){
-      html+='<tr style="background:#f5f3ff"><td colspan="6"><strong>'+esc(group.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+group.items.length+' variants)</span></td></tr>';
+      const totalStock=group.items.reduce((s,p)=>s+(p.stock||0),0);
+      const minTeam=Math.min(...group.items.map(p=>p.teamPrice||999999));
+      const minRetail=Math.min(...group.items.map(p=>p.retailPrice||999999));
+      html+='<tr style="cursor:pointer" onclick="toggleVariants(\\'pv-'+pid+'\\',this.querySelector(\\'button\\'))"><td style="text-align:center"><button class="edit-btn" onclick="event.stopPropagation();toggleVariants(\\'pv-'+pid+'\\',this)" style="transition:transform 0.15s;transform:rotate(-90deg)">${ICONS.back}</button></td><td><strong>'+esc(group.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+group.items.length+' variants)</span></td><td style="color:#6b7280;font-size:12px">-</td><td style="font-weight:600;color:#4f46e5">from $'+minTeam.toFixed(2)+'</td><td style="color:#9ca3af">from $'+minRetail.toFixed(2)+'</td><td>'+totalStock+'</td></tr>';
       for(const p of group.items){
-        html+='<tr><td style="padding-left:32px"></td><td style="color:#6b7280;font-size:12px">'+esc(p.variantLabel||'-')+'</td><td style="color:#6b7280;font-size:12px">'+esc(p.sku||'-')+'</td><td style="font-weight:600;color:#4f46e5">$'+(p.teamPrice||0).toFixed(2)+'</td><td style="color:#9ca3af">$'+(p.retailPrice||0).toFixed(2)+'</td><td>'+(p.stock||0)+'</td></tr>';
+        html+='<tr class="variant-row pv-'+pid+'" style="display:none"><td></td><td style="padding-left:32px;color:#6b7280;font-size:12px">'+esc(p.variantLabel||p.variantName||'-')+'</td><td style="color:#6b7280;font-size:12px">'+esc(p.sku||'-')+'</td><td style="font-weight:600;color:#4f46e5;font-size:12px">$'+(p.teamPrice||0).toFixed(2)+'</td><td style="color:#9ca3af;font-size:12px">$'+(p.retailPrice||0).toFixed(2)+'</td><td>'+(p.stock>0?'<span class="badge-status badge-success">'+p.stock+'</span>':'<span style="color:#9ca3af">0</span>')+'</td></tr>';
       }
     }
     for(const p of standaloneP){
-      html+='<tr><td><div class="prod-name">'+esc(p.name)+'</div></td><td>-</td><td style="color:#6b7280;font-size:12px">'+esc(p.sku||'-')+'</td><td style="font-weight:600;color:#4f46e5">$'+(p.teamPrice||0).toFixed(2)+'</td><td style="color:#9ca3af">$'+(p.retailPrice||0).toFixed(2)+'</td><td>'+(p.stock||0)+'</td></tr>';
+      html+='<tr><td></td><td><div class="prod-name">'+esc(p.name)+'</div></td><td style="color:#6b7280;font-size:12px">'+esc(p.sku||'-')+'</td><td style="font-weight:600;color:#4f46e5">$'+(p.teamPrice||0).toFixed(2)+'</td><td style="color:#9ca3af">$'+(p.retailPrice||0).toFixed(2)+'</td><td>'+(p.stock||0)+'</td></tr>';
     }
 
     html+='</tbody></table></div></div>';
