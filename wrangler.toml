@@ -5,3 +5,6 @@ compatibility_date = "2024-01-01"
 [[kv_namespaces]]
 binding = "STORE_DATA"
 id = "449fff5b380f44e4b7f0468301cd8c79"
+
+[triggers]
+crons = ["*/30 * * * *"]

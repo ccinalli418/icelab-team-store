@@ -1,5 +1,6 @@
 // Ice Lab Team Store — Cloudflare Worker
-// Standalone e-commerce store for hockey equipment & team gear
+// Lightspeed Retail X-Series POS Integration
+// Customer-facing ordering portal with Stripe checkout
 
 export default {
   async fetch(request, env) {
@@ -7,40 +8,54 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
+    // CORS preflight
+    if (method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders() });
+
     // --- API Routes ---
     if (path.startsWith('/api/')) {
       try {
+        // Auth
         if (path === '/api/verify-pin' && method === 'POST') return apiVerifyPin(request, env);
         if (path === '/api/verify-admin-pin' && method === 'POST') return apiVerifyAdminPin(request, env);
+
+        // Public storefront
         if (path === '/api/categories' && method === 'GET') return apiGetCategories(env);
         if (path === '/api/products' && method === 'GET') return apiGetProducts(url, env);
         if (path.match(/^\/api\/product\/[^/]+$/) && method === 'GET') return apiGetProduct(path.split('/')[3], env);
+
+        // Checkout
         if (path === '/api/checkout' && method === 'POST') return apiCheckout(request, env);
         if (path === '/api/stripe/webhook' && method === 'POST') return apiStripeWebhook(request, env);
-        if (path === '/api/admin/categories' && method === 'GET') return apiAdminGetCategories(env);
-        if (path === '/api/admin/category' && method === 'POST') return apiAdminSaveCategory(request, env);
-        if (path.match(/^\/api\/admin\/category\/[^/]+$/) && method === 'DELETE') return apiAdminDeleteCategory(path.split('/')[4], env);
-        if (path === '/api/admin/products' && method === 'GET') return apiAdminGetProducts(env);
-        if (path === '/api/admin/product' && method === 'POST') return apiAdminSaveProduct(request, env);
-        if (path.match(/^\/api\/admin\/product\/[^/]+$/) && method === 'DELETE') return apiAdminDeleteProduct(path.split('/')[4], env);
+
+        // Admin — Lightspeed
+        if (path === '/api/admin/lightspeed/test' && method === 'GET') return apiLightspeedTest(env);
+        if (path === '/api/admin/lightspeed/sync' && method === 'GET') return apiLightspeedSync(env);
+        if (path === '/api/admin/lightspeed/toggle' && method === 'POST') return apiLightspeedToggle(request, env);
+        if (path === '/api/admin/lightspeed/price' && method === 'POST') return apiLightspeedPrice(request, env);
+        if (path === '/api/admin/import-products' && method === 'GET') return apiImportProducts(env);
+
+        // Admin — general
         if (path === '/api/admin/orders' && method === 'GET') return apiAdminGetOrders(url, env);
-        if (path === '/api/admin/order/status' && method === 'POST') return apiAdminUpdateOrderStatus(request, env);
+        if (path === '/api/admin/enabled-products' && method === 'GET') return apiAdminEnabledProducts(env);
         if (path === '/api/admin/config' && method === 'GET') return apiAdminGetConfig(env);
         if (path === '/api/admin/config' && method === 'POST') return apiAdminSaveConfig(request, env);
-        if (path === '/api/admin/seed' && method === 'POST') return apiAdminSeed(env);
-        if (path === '/api/admin/custom-attributes' && method === 'GET') return apiGetCustomAttributes(env);
-        if (path === '/api/admin/custom-attributes' && method === 'POST') return apiSaveCustomAttribute(request, env);
+
         return json({ error: 'Not found' }, 404);
       } catch (e) {
-        console.error('API Error:', e);
-        return json({ error: 'Internal server error' }, 500);
+        console.error('API Error:', e.message, e.stack);
+        return json({ error: 'Internal server error', detail: e.message }, 500);
       }
     }
 
+    // Pages
     if (path === '/admin' || path.startsWith('/admin')) return htmlResponse(adminPage());
     if (path === '/checkout/success') return htmlResponse(checkoutSuccessPage());
     if (path === '/checkout/cancel') return htmlResponse(checkoutCancelPage());
     return htmlResponse(storePage());
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(cronSyncProducts(env));
   }
 };
 
@@ -48,21 +63,31 @@ export default {
 // HELPERS
 // ============================================================
 function json(data, status = 200) {
-  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...corsHeaders() } });
 }
 function htmlResponse(html) {
   return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' } });
+}
+function corsHeaders() {
+  return { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
 }
 function generateId(prefix) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).substr(2, 6)}`;
 }
 async function getConfig(env) {
   const config = await env.STORE_DATA.get('config', 'json');
-  return config || { storeName: 'Ice Lab Team Store', storePin: '1234', adminPin: '9999', stripePublishableKey: '', stripeSecretKey: '', stripeWebhookSecret: '' };
+  return config || { storeName: 'Ice Lab Team Store', storePin: '1234', adminPin: '9999', stripePublishableKey: '', stripeSecretKey: '', stripeWebhookSecret: '', discountPercent: 15 };
+}
+function lsApi(env) {
+  const prefix = env.LIGHTSPEED_DOMAIN_PREFIX || 'icelabproshop';
+  return `https://${prefix}.retail.lightspeed.app/api/2.0`;
+}
+function lsHeaders(env) {
+  return { 'Authorization': `Bearer ${env.LIGHTSPEED_API_TOKEN}`, 'Content-Type': 'application/json', 'Accept': 'application/json' };
 }
 
 // ============================================================
-// STORE PIN API
+// PIN VERIFICATION
 // ============================================================
 async function apiVerifyPin(request, env) {
   const { pin } = await request.json();
@@ -78,26 +103,334 @@ async function apiVerifyAdminPin(request, env) {
 }
 
 // ============================================================
-// PUBLIC PRODUCT APIs
+// LIGHTSPEED API HELPERS
+// ============================================================
+async function lsFetchAll(env, endpoint) {
+  let all = [];
+  let after = 0;
+  let pages = 0;
+  while (pages < 50) {
+    const sep = endpoint.includes('?') ? '&' : '?';
+    const url = `${lsApi(env)}/${endpoint}${after ? `${sep}after=${after}` : ''}`;
+    const resp = await fetch(url, { headers: lsHeaders(env) });
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`Lightspeed API error ${resp.status}: ${text}`);
+    }
+    const data = await resp.json();
+    const key = Object.keys(data).find(k => Array.isArray(data[k]));
+    if (key) all = all.concat(data[key]);
+    if (data.version && data.version.max && data.version.max > after) {
+      after = data.version.max;
+      pages++;
+    } else {
+      break;
+    }
+    if (!key || data[key].length === 0) break;
+  }
+  return all;
+}
+
+async function lsFetch(env, endpoint, options = {}) {
+  const url = `${lsApi(env)}/${endpoint}`;
+  const resp = await fetch(url, { headers: lsHeaders(env), ...options });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Lightspeed API error ${resp.status}: ${text}`);
+  }
+  return resp.json();
+}
+
+// ============================================================
+// LIGHTSPEED ADMIN APIs
+// ============================================================
+async function apiLightspeedTest(env) {
+  if (!env.LIGHTSPEED_API_TOKEN) return json({ success: false, error: 'LIGHTSPEED_API_TOKEN not configured' });
+  try {
+    const data = await lsFetch(env, 'outlets');
+    const outlets = data.outlets || data.data || [];
+    return json({ success: true, message: `Connected. Found ${outlets.length} outlet(s).`, outlets: outlets.map(o => ({ id: o.id, name: o.name })) });
+  } catch (e) {
+    return json({ success: false, error: e.message });
+  }
+}
+
+async function apiLightspeedSync(env) {
+  if (!env.LIGHTSPEED_API_TOKEN) return json({ error: 'Lightspeed not configured' }, 400);
+  try {
+    const products = await lsFetchAll(env, 'products?page_size=100');
+    await env.STORE_DATA.put('ls_products_cache', JSON.stringify(products));
+    await env.STORE_DATA.put('ls_sync_timestamp', new Date().toISOString());
+
+    // Extract categories (brands/types from Lightspeed)
+    const brands = [...new Set(products.map(p => p.brand_name || p.supplier_name).filter(Boolean))];
+    const types = [...new Set(products.map(p => p.type || p.product_type_name || p.product_type).filter(Boolean))];
+
+    // Update enabled product configs with fresh data
+    let updatedCount = 0;
+    for (const p of products) {
+      const configKey = `ts_enabled:${p.id}`;
+      const existing = await env.STORE_DATA.get(configKey, 'json');
+      if (existing && existing.enabled) {
+        // Update stock and price from Lightspeed but keep team price override
+        existing.currentStock = p.inventory?.[0]?.current_amount ?? p.current_inventory ?? 0;
+        existing.retailPrice = parseFloat(p.price_including_tax || p.price || 0);
+        existing.name = p.name;
+        existing.updatedAt = new Date().toISOString();
+        await env.STORE_DATA.put(configKey, JSON.stringify(existing));
+        updatedCount++;
+      }
+    }
+
+    return json({
+      success: true,
+      totalProducts: products.length,
+      brands,
+      types,
+      updatedEnabled: updatedCount,
+      syncedAt: new Date().toISOString()
+    });
+  } catch (e) {
+    return json({ error: e.message }, 500);
+  }
+}
+
+async function apiLightspeedToggle(request, env) {
+  const { productId, enabled } = await request.json();
+  if (!productId) return json({ error: 'productId required' }, 400);
+
+  const configKey = `ts_enabled:${productId}`;
+  const config = await getConfig(env);
+  const discount = config.discountPercent || 15;
+
+  if (enabled) {
+    // Fetch fresh product data from cache
+    const cache = await env.STORE_DATA.get('ls_products_cache', 'json') || [];
+    const product = cache.find(p => p.id === productId);
+    if (!product) return json({ error: 'Product not found in cache. Run sync first.' }, 404);
+
+    const retailPrice = parseFloat(product.price_including_tax || product.price || 0);
+    const teamPrice = Math.round(retailPrice * (1 - discount / 100) * 100) / 100;
+
+    const tsConfig = {
+      enabled: true,
+      lightspeedId: productId,
+      name: product.name,
+      brand: product.brand_name || product.supplier_name || '',
+      sku: product.sku || product.supply_price ? '' : '',
+      retailPrice,
+      teamPrice,
+      currentStock: product.inventory?.[0]?.current_amount ?? product.current_inventory ?? 0,
+      images: product.images || product.image_url ? [product.image_url || product.images?.[0]?.url] : [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    await env.STORE_DATA.put(configKey, JSON.stringify(tsConfig));
+    return json(tsConfig);
+  } else {
+    const existing = await env.STORE_DATA.get(configKey, 'json');
+    if (existing) {
+      existing.enabled = false;
+      existing.updatedAt = new Date().toISOString();
+      await env.STORE_DATA.put(configKey, JSON.stringify(existing));
+    }
+    return json({ enabled: false, productId });
+  }
+}
+
+async function apiLightspeedPrice(request, env) {
+  const { productId, teamPrice } = await request.json();
+  if (!productId) return json({ error: 'productId required' }, 400);
+  const configKey = `ts_enabled:${productId}`;
+  const existing = await env.STORE_DATA.get(configKey, 'json');
+  if (!existing) return json({ error: 'Product not enabled in team store' }, 404);
+  existing.teamPrice = parseFloat(teamPrice) || 0;
+  existing.updatedAt = new Date().toISOString();
+  await env.STORE_DATA.put(configKey, JSON.stringify(existing));
+  return json(existing);
+}
+
+async function apiImportProducts(env) {
+  const cache = await env.STORE_DATA.get('ls_products_cache', 'json') || [];
+  const syncTimestamp = await env.STORE_DATA.get('ls_sync_timestamp') || null;
+  const config = await getConfig(env);
+
+  // Get enabled status for each product
+  const enriched = [];
+  for (const p of cache) {
+    const tsConfig = await env.STORE_DATA.get(`ts_enabled:${p.id}`, 'json');
+    enriched.push({
+      id: p.id,
+      name: p.name,
+      brand: p.brand_name || p.supplier_name || '',
+      sku: p.sku || '',
+      type: p.type || p.product_type_name || p.product_type || '',
+      retailPrice: parseFloat(p.price_including_tax || p.price || 0),
+      stock: p.inventory?.[0]?.current_amount ?? p.current_inventory ?? 0,
+      hasVariants: p.has_variants || false,
+      variantCount: p.variant_count || 0,
+      variantParentId: p.variant_parent_id || null,
+      variantName: p.variant_name || null,
+      images: p.images || (p.image_url ? [{ url: p.image_url }] : []),
+      imageUrl: p.image_url || p.images?.[0]?.url || null,
+      enabled: tsConfig?.enabled || false,
+      teamPrice: tsConfig?.teamPrice || null,
+      description: p.description || ''
+    });
+  }
+
+  return json({
+    products: enriched,
+    syncTimestamp,
+    discountPercent: config.discountPercent || 15,
+    totalProducts: enriched.length
+  });
+}
+
+// ============================================================
+// PUBLIC STOREFRONT APIs
 // ============================================================
 async function apiGetCategories(env) {
-  const ids = await env.STORE_DATA.get('categories', 'json') || [];
-  const cats = [];
-  for (const id of ids) { const cat = await env.STORE_DATA.get(`category:${id}`, 'json'); if (cat && cat.active !== false) cats.push(cat); }
-  cats.sort((a, b) => (a.order || 0) - (b.order || 0));
-  return json(cats);
+  // Build categories from enabled products' brands/types
+  const cache = await env.STORE_DATA.get('ls_products_cache', 'json') || [];
+  const enabledProducts = [];
+  for (const p of cache) {
+    const tsConfig = await env.STORE_DATA.get(`ts_enabled:${p.id}`, 'json');
+    if (tsConfig?.enabled) enabledProducts.push({ ...p, tsConfig });
+  }
+  // Group by product type
+  const typeMap = {};
+  for (const p of enabledProducts) {
+    if (p.variant_parent_id) continue; // skip child variants for category counting
+    const type = p.type || p.product_type_name || p.product_type || 'Other';
+    if (!typeMap[type]) typeMap[type] = { id: type, name: type, count: 0 };
+    typeMap[type].count++;
+  }
+  return json(Object.values(typeMap).sort((a, b) => a.name.localeCompare(b.name)));
 }
+
 async function apiGetProducts(url, env) {
-  const categoryId = url.searchParams.get('category');
-  const ids = await env.STORE_DATA.get('products', 'json') || [];
-  const products = [];
-  for (const id of ids) { const p = await env.STORE_DATA.get(`product:${id}`, 'json'); if (!p || !p.active) continue; if (categoryId && p.category !== categoryId) continue; products.push(p); }
-  return json(products);
+  const category = url.searchParams.get('category');
+  const cache = await env.STORE_DATA.get('ls_products_cache', 'json') || [];
+  const config = await getConfig(env);
+  const discount = config.discountPercent || 15;
+
+  const enabledProducts = [];
+  for (const p of cache) {
+    const tsConfig = await env.STORE_DATA.get(`ts_enabled:${p.id}`, 'json');
+    if (!tsConfig?.enabled) continue;
+
+    const type = p.type || p.product_type_name || p.product_type || 'Other';
+    if (category && type !== category) continue;
+
+    enabledProducts.push(buildStorefrontProduct(p, tsConfig, discount));
+  }
+
+  // Group by variant_parent_id — show parent products as cards
+  const grouped = groupVariantProducts(enabledProducts);
+  return json(grouped);
 }
+
 async function apiGetProduct(id, env) {
-  const p = await env.STORE_DATA.get(`product:${id}`, 'json');
-  if (!p) return json({ error: 'Product not found' }, 404);
-  return json(p);
+  const cache = await env.STORE_DATA.get('ls_products_cache', 'json') || [];
+  const config = await getConfig(env);
+  const discount = config.discountPercent || 15;
+
+  // Find the product (could be a parent or standalone)
+  const product = cache.find(p => p.id === id);
+  if (!product) return json({ error: 'Product not found' }, 404);
+
+  const tsConfig = await env.STORE_DATA.get(`ts_enabled:${id}`, 'json');
+  if (!tsConfig?.enabled) return json({ error: 'Product not available' }, 404);
+
+  const result = buildStorefrontProduct(product, tsConfig, discount);
+
+  // If this has variants, find all child variants
+  if (product.has_variants) {
+    const children = cache.filter(p => p.variant_parent_id === id);
+    result.variants = [];
+    for (const child of children) {
+      const childConfig = await env.STORE_DATA.get(`ts_enabled:${child.id}`, 'json');
+      result.variants.push({
+        id: child.id,
+        name: child.variant_name || child.name,
+        sku: child.sku || '',
+        retailPrice: parseFloat(child.price_including_tax || child.price || 0),
+        teamPrice: childConfig?.teamPrice || Math.round(parseFloat(child.price_including_tax || child.price || 0) * (1 - discount / 100) * 100) / 100,
+        stock: child.inventory?.[0]?.current_amount ?? child.current_inventory ?? 0,
+        enabled: childConfig?.enabled !== false
+      });
+    }
+  }
+
+  return json(result);
+}
+
+function buildStorefrontProduct(p, tsConfig, discount) {
+  const retailPrice = parseFloat(p.price_including_tax || p.price || 0);
+  const teamPrice = tsConfig?.teamPrice || Math.round(retailPrice * (1 - discount / 100) * 100) / 100;
+  return {
+    id: p.id,
+    name: p.name,
+    description: p.description || '',
+    brand: p.brand_name || p.supplier_name || '',
+    type: p.type || p.product_type_name || p.product_type || '',
+    sku: p.sku || '',
+    retailPrice,
+    teamPrice,
+    stock: p.inventory?.[0]?.current_amount ?? p.current_inventory ?? 0,
+    hasVariants: p.has_variants || false,
+    variantParentId: p.variant_parent_id || null,
+    variantName: p.variant_name || null,
+    imageUrl: p.image_url || p.images?.[0]?.url || null
+  };
+}
+
+function groupVariantProducts(products) {
+  const parents = {};
+  const standalone = [];
+
+  for (const p of products) {
+    if (p.variantParentId) {
+      // This is a child variant
+      if (!parents[p.variantParentId]) {
+        parents[p.variantParentId] = {
+          id: p.variantParentId,
+          name: p.name?.replace(/ - .*$/, '') || p.name,
+          brand: p.brand,
+          type: p.type,
+          imageUrl: p.imageUrl,
+          retailPrice: p.retailPrice,
+          teamPrice: p.teamPrice,
+          hasVariants: true,
+          totalStock: 0,
+          variantCount: 0,
+          description: p.description
+        };
+      }
+      parents[p.variantParentId].totalStock += (p.stock || 0);
+      parents[p.variantParentId].variantCount++;
+      // Use lowest team price
+      if (p.teamPrice < parents[p.variantParentId].teamPrice) {
+        parents[p.variantParentId].teamPrice = p.teamPrice;
+        parents[p.variantParentId].retailPrice = p.retailPrice;
+      }
+      if (!parents[p.variantParentId].imageUrl && p.imageUrl) {
+        parents[p.variantParentId].imageUrl = p.imageUrl;
+      }
+    } else if (p.hasVariants) {
+      // This is a parent product — use it as the card
+      if (!parents[p.id]) {
+        parents[p.id] = { ...p, totalStock: p.stock || 0, variantCount: 0 };
+      } else {
+        parents[p.id] = { ...parents[p.id], ...p, totalStock: parents[p.id].totalStock + (p.stock || 0) };
+      }
+    } else {
+      standalone.push({ ...p, totalStock: p.stock || 0 });
+    }
+  }
+
+  return [...Object.values(parents), ...standalone];
 }
 
 // ============================================================
@@ -109,36 +442,47 @@ async function apiCheckout(request, env) {
   const { items, customer } = await request.json();
   if (!items?.length) return json({ error: 'Cart is empty' }, 400);
   if (!customer?.name || !customer?.email || !customer?.phone) return json({ error: 'Customer info required' }, 400);
+
   const lineItems = [];
   for (const item of items) {
-    const product = await env.STORE_DATA.get(`product:${item.productId}`, 'json');
-    if (!product) return json({ error: `Product not found: ${item.productId}` }, 400);
-    if (item.variantId) {
-      const variant = product.variants?.find(v => v.id === item.variantId);
-      if (variant && variant.stock !== null && variant.stock !== undefined && variant.stock < item.qty) {
-        return json({ error: `Insufficient stock for ${product.name}` }, 400);
-      }
-    }
-    const price = item.variantId ? (product.variants?.find(v => v.id === item.variantId)?.retailPrice || product.variants?.find(v => v.id === item.variantId)?.price || product.price) : product.price;
-    let itemName = product.name;
-    if (item.options && Object.keys(item.options).length > 0) itemName += ' (' + Object.values(item.options).join(', ') + ')';
-    lineItems.push({ price_data: { currency: 'usd', product_data: { name: itemName }, unit_amount: Math.round(price * 100) }, quantity: item.qty });
+    let itemName = item.name || 'Product';
+    if (item.variantName) itemName += ` - ${item.variantName}`;
+    lineItems.push({
+      price_data: { currency: 'usd', product_data: { name: itemName }, unit_amount: Math.round((item.teamPrice || item.price) * 100) },
+      quantity: item.qty
+    });
   }
+
   const origin = new URL(request.url).origin;
   const session = await fetch('https://api.stripe.com/v1/checkout/sessions', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${config.stripeSecretKey}`, 'Content-Type': 'application/x-www-form-urlencoded' },
     body: buildStripeBody({
-      'mode': 'payment', 'success_url': `${origin}/checkout/success?session_id={CHECKOUT_SESSION_ID}`, 'cancel_url': `${origin}/checkout/cancel`,
-      'customer_email': customer.email, 'metadata[customerName]': customer.name, 'metadata[customerPhone]': customer.phone, 'metadata[items]': JSON.stringify(items),
-      ...lineItems.reduce((acc, li, i) => { acc[`line_items[${i}][price_data][currency]`] = li.price_data.currency; acc[`line_items[${i}][price_data][product_data][name]`] = li.price_data.product_data.name; acc[`line_items[${i}][price_data][unit_amount]`] = li.price_data.unit_amount; acc[`line_items[${i}][quantity]`] = li.quantity; return acc; }, {})
+      'mode': 'payment',
+      'success_url': `${origin}/checkout/success?session_id={CHECKOUT_SESSION_ID}`,
+      'cancel_url': `${origin}/checkout/cancel`,
+      'customer_email': customer.email,
+      'metadata[customerName]': customer.name,
+      'metadata[customerPhone]': customer.phone,
+      'metadata[items]': JSON.stringify(items),
+      ...lineItems.reduce((acc, li, i) => {
+        acc[`line_items[${i}][price_data][currency]`] = li.price_data.currency;
+        acc[`line_items[${i}][price_data][product_data][name]`] = li.price_data.product_data.name;
+        acc[`line_items[${i}][price_data][unit_amount]`] = li.price_data.unit_amount;
+        acc[`line_items[${i}][quantity]`] = li.quantity;
+        return acc;
+      }, {})
     })
   });
+
   const sessionData = await session.json();
   if (sessionData.error) return json({ error: sessionData.error.message }, 400);
   return json({ url: sessionData.url, sessionId: sessionData.id });
 }
-function buildStripeBody(params) { return Object.entries(params).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&'); }
+
+function buildStripeBody(params) {
+  return Object.entries(params).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
+}
 
 // ============================================================
 // STRIPE WEBHOOK
@@ -146,35 +490,66 @@ function buildStripeBody(params) { return Object.entries(params).map(([k, v]) =>
 async function apiStripeWebhook(request, env) {
   const config = await getConfig(env);
   const body = await request.text();
+
   if (config.stripeWebhookSecret) {
     const sig = request.headers.get('stripe-signature');
     const valid = await verifyStripeSignature(body, sig, config.stripeWebhookSecret);
     if (!valid) return json({ error: 'Invalid signature' }, 400);
   }
+
   const event = JSON.parse(body);
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const items = JSON.parse(session.metadata?.items || '[]');
+
     const order = {
-      id: generateId('ord'), status: 'pending',
-      customer: { name: session.metadata?.customerName || '', email: session.customer_email || session.customer_details?.email || '', phone: session.metadata?.customerPhone || '' },
-      items, total: session.amount_total / 100, stripeSessionId: session.id, stripePaymentIntent: session.payment_intent,
-      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), pickupReadyAt: null, pickedUpAt: null
+      id: generateId('ord'),
+      customer: {
+        name: session.metadata?.customerName || '',
+        email: session.customer_email || session.customer_details?.email || '',
+        phone: session.metadata?.customerPhone || ''
+      },
+      items,
+      total: session.amount_total / 100,
+      stripeSessionId: session.id,
+      stripePaymentIntent: session.payment_intent,
+      createdAt: new Date().toISOString(),
+      lightspeedSaleId: null,
+      lightspeedSyncFailed: false,
+      notificationSent: false
     };
+
+    // Try to create Lightspeed sale
+    if (env.LIGHTSPEED_API_TOKEN) {
+      try {
+        const saleId = await createLightspeedSale(env, order);
+        order.lightspeedSaleId = saleId;
+      } catch (e) {
+        console.error('Lightspeed sale creation failed:', e.message);
+        order.lightspeedSyncFailed = true;
+        order.lightspeedError = e.message;
+      }
+    }
+
+    // Save order
     await env.STORE_DATA.put(`order:${order.id}`, JSON.stringify(order));
     const orderIds = await env.STORE_DATA.get('orders', 'json') || [];
     orderIds.unshift(order.id);
     await env.STORE_DATA.put('orders', JSON.stringify(orderIds));
-    for (const item of items) {
-      const product = await env.STORE_DATA.get(`product:${item.productId}`, 'json');
-      if (product && item.variantId) {
-        const variant = product.variants?.find(v => v.id === item.variantId);
-        if (variant && variant.stock !== null && variant.stock !== undefined) { variant.stock = Math.max(0, variant.stock - item.qty); await env.STORE_DATA.put(`product:${product.id}`, JSON.stringify(product)); }
-      }
+
+    // Send notification email
+    try {
+      await sendOrderNotification(env, order);
+      order.notificationSent = true;
+      await env.STORE_DATA.put(`order:${order.id}`, JSON.stringify(order));
+    } catch (e) {
+      console.error('Notification email failed:', e.message);
     }
   }
+
   return json({ received: true });
 }
+
 async function verifyStripeSignature(payload, sigHeader, secret) {
   if (!sigHeader) return false;
   try {
@@ -188,76 +563,173 @@ async function verifyStripeSignature(payload, sigHeader, secret) {
 }
 
 // ============================================================
+// LIGHTSPEED SALE CREATION
+// ============================================================
+async function createLightspeedSale(env, order) {
+  // Get register
+  const registersData = await lsFetch(env, 'registers');
+  const registers = registersData.registers || registersData.data || [];
+  if (!registers.length) throw new Error('No registers found');
+  const registerId = registers[0].id;
+
+  // Get primary user
+  const usersData = await lsFetch(env, 'users');
+  const users = usersData.users || usersData.data || [];
+  if (!users.length) throw new Error('No users found');
+  const userId = users[0].id;
+
+  // Find or create customer
+  let customerId = null;
+  if (order.customer.email) {
+    try {
+      const custSearch = await lsFetch(env, `customers?email=${encodeURIComponent(order.customer.email)}`);
+      const customers = custSearch.customers || custSearch.data || [];
+      if (customers.length > 0) {
+        customerId = customers[0].id;
+      }
+    } catch (e) {
+      console.error('Customer search failed:', e.message);
+    }
+  }
+
+  if (!customerId && order.customer.email) {
+    try {
+      const nameParts = (order.customer.name || '').split(' ');
+      const newCust = await lsFetch(env, 'customers', {
+        method: 'POST',
+        body: JSON.stringify({
+          first_name: nameParts[0] || '',
+          last_name: nameParts.slice(1).join(' ') || '',
+          email: order.customer.email,
+          phone: order.customer.phone || ''
+        })
+      });
+      customerId = newCust.customer?.id || newCust.id;
+    } catch (e) {
+      console.error('Customer creation failed:', e.message);
+    }
+  }
+
+  // Get a "layby/on account" payment type (or fallback)
+  let paymentTypeId = null;
+  try {
+    const ptData = await lsFetch(env, 'payment_types');
+    const paymentTypes = ptData.payment_types || ptData.data || [];
+    const onAccount = paymentTypes.find(pt => pt.name?.toLowerCase().includes('account') || pt.name?.toLowerCase().includes('layby'));
+    paymentTypeId = onAccount?.id || paymentTypes[0]?.id;
+  } catch (e) {
+    console.error('Payment types fetch failed:', e.message);
+  }
+
+  // Build sale products
+  const saleProducts = order.items.map(item => ({
+    product_id: item.lightspeedId || item.productId,
+    quantity: item.qty,
+    price: item.teamPrice || item.price,
+    tax: 0
+  }));
+
+  // Build sale payload
+  const salePayload = {
+    register_id: registerId,
+    user_id: userId,
+    status: 'on_account',
+    note: `TEAM ORDER - Paid via Stripe - ${order.customer.name} - ${order.customer.phone}`,
+    register_sale_products: saleProducts
+  };
+
+  if (customerId) salePayload.customer_id = customerId;
+
+  if (paymentTypeId) {
+    salePayload.register_sale_payments = [{
+      payment_type_id: paymentTypeId,
+      amount: order.total
+    }];
+  }
+
+  const saleResp = await lsFetch(env, 'register_sales', {
+    method: 'POST',
+    body: JSON.stringify(salePayload)
+  });
+
+  return saleResp.register_sale?.id || saleResp.id || 'unknown';
+}
+
+// ============================================================
+// EMAIL NOTIFICATION
+// ============================================================
+async function sendOrderNotification(env, order) {
+  const notifyEmail = env.NOTIFICATION_EMAIL || 'hello@icelabproshop.com';
+
+  const itemRows = (order.items || []).map(item => {
+    const name = item.name || 'Product';
+    const variant = item.variantName ? ` - ${item.variantName}` : '';
+    return `<tr><td style="padding:8px;border-bottom:1px solid #eee">${name}${variant}</td><td style="padding:8px;border-bottom:1px solid #eee;text-align:center">${item.qty}</td><td style="padding:8px;border-bottom:1px solid #eee;text-align:right">$${((item.teamPrice || item.price || 0) * item.qty).toFixed(2)}</td></tr>`;
+  }).join('');
+
+  const html = `
+    <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+      <h2 style="color:#4f46e5">New Team Store Order</h2>
+      <p><strong>Order #:</strong> ${order.id.slice(-6).toUpperCase()}</p>
+      <p><strong>Customer:</strong> ${order.customer?.name || 'N/A'}</p>
+      <p><strong>Email:</strong> ${order.customer?.email || 'N/A'}</p>
+      <p><strong>Phone:</strong> ${order.customer?.phone || 'N/A'}</p>
+      ${order.lightspeedSaleId ? `<p><strong>Lightspeed Sale:</strong> ${order.lightspeedSaleId}</p>` : '<p style="color:#dc2626"><strong>Lightspeed sync failed - create sale manually</strong></p>'}
+      <table style="width:100%;border-collapse:collapse;margin:16px 0">
+        <thead><tr style="background:#f8f9fa"><th style="padding:8px;text-align:left">Item</th><th style="padding:8px;text-align:center">Qty</th><th style="padding:8px;text-align:right">Total</th></tr></thead>
+        <tbody>${itemRows}</tbody>
+        <tfoot><tr><td colspan="2" style="padding:8px;font-weight:bold">Total</td><td style="padding:8px;text-align:right;font-weight:bold">$${(order.total || 0).toFixed(2)}</td></tr></tfoot>
+      </table>
+    </div>`;
+
+  await fetch('https://api.mailchannels.net/tx/v1/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      personalizations: [{ to: [{ email: notifyEmail }] }],
+      from: { email: 'noreply@icelabproshop.com', name: 'Ice Lab Team Store' },
+      subject: `New Team Order #${order.id.slice(-6).toUpperCase()} - ${order.customer?.name || 'Customer'}`,
+      content: [{ type: 'text/html', value: html }]
+    })
+  });
+}
+
+// ============================================================
 // ADMIN APIs
 // ============================================================
-async function apiAdminGetCategories(env) {
-  const ids = await env.STORE_DATA.get('categories', 'json') || [];
-  const cats = [];
-  for (const id of ids) { const cat = await env.STORE_DATA.get(`category:${id}`, 'json'); if (cat) cats.push(cat); }
-  cats.sort((a, b) => (a.order || 0) - (b.order || 0));
-  return json(cats);
-}
-async function apiAdminSaveCategory(request, env) {
-  const data = await request.json();
-  const isNew = !data.id;
-  const id = data.id || generateId('cat');
-  const category = { id, name: data.name, description: data.description || '', image: data.image || '', order: data.order || 0, active: data.active !== false, createdAt: data.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString() };
-  await env.STORE_DATA.put(`category:${id}`, JSON.stringify(category));
-  if (isNew) { const ids = await env.STORE_DATA.get('categories', 'json') || []; ids.push(id); await env.STORE_DATA.put('categories', JSON.stringify(ids)); }
-  return json(category);
-}
-async function apiAdminDeleteCategory(id, env) {
-  await env.STORE_DATA.delete(`category:${id}`);
-  const ids = await env.STORE_DATA.get('categories', 'json') || [];
-  await env.STORE_DATA.put('categories', JSON.stringify(ids.filter(i => i !== id)));
-  return json({ success: true });
-}
-async function apiAdminGetProducts(env) {
-  const ids = await env.STORE_DATA.get('products', 'json') || [];
-  const products = [];
-  for (const id of ids) { const p = await env.STORE_DATA.get(`product:${id}`, 'json'); if (p) products.push(p); }
-  return json(products);
-}
-async function apiAdminSaveProduct(request, env) {
-  const data = await request.json();
-  const isNew = !data.id;
-  const id = data.id || generateId('prod');
-  const product = {
-    id, name: data.name, description: data.description || '', category: data.category || '',
-    price: parseFloat(data.price) || 0, images: data.images || [],
-    supplier: data.supplier || '', supplierCode: data.supplierCode || '',
-    supplyPrice: parseFloat(data.supplyPrice) || 0,
-    variantTypes: data.variantTypes || [], variants: data.variants || [],
-    active: data.active !== false,
-    createdAt: data.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString()
-  };
-  await env.STORE_DATA.put(`product:${id}`, JSON.stringify(product));
-  if (isNew) { const ids = await env.STORE_DATA.get('products', 'json') || []; ids.push(id); await env.STORE_DATA.put('products', JSON.stringify(ids)); }
-  return json(product);
-}
-async function apiAdminDeleteProduct(id, env) {
-  const product = await env.STORE_DATA.get(`product:${id}`, 'json');
-  if (product) { product.active = false; product.updatedAt = new Date().toISOString(); await env.STORE_DATA.put(`product:${id}`, JSON.stringify(product)); }
-  return json({ success: true });
-}
 async function apiAdminGetOrders(url, env) {
-  const status = url.searchParams.get('status');
   const ids = await env.STORE_DATA.get('orders', 'json') || [];
   const orders = [];
-  for (const id of ids) { const o = await env.STORE_DATA.get(`order:${id}`, 'json'); if (!o) continue; if (status && o.status !== status) continue; orders.push(o); }
+  for (const id of ids) {
+    const o = await env.STORE_DATA.get(`order:${id}`, 'json');
+    if (o) orders.push(o);
+  }
   return json(orders);
 }
-async function apiAdminUpdateOrderStatus(request, env) {
-  const { orderId, status } = await request.json();
-  const order = await env.STORE_DATA.get(`order:${orderId}`, 'json');
-  if (!order) return json({ error: 'Order not found' }, 404);
-  order.status = status; order.updatedAt = new Date().toISOString();
-  if (status === 'ready') order.pickupReadyAt = new Date().toISOString();
-  if (status === 'picked_up') order.pickedUpAt = new Date().toISOString();
-  await env.STORE_DATA.put(`order:${order.id}`, JSON.stringify(order));
-  return json(order);
+
+async function apiAdminEnabledProducts(env) {
+  const cache = await env.STORE_DATA.get('ls_products_cache', 'json') || [];
+  const enabled = [];
+  for (const p of cache) {
+    const tsConfig = await env.STORE_DATA.get(`ts_enabled:${p.id}`, 'json');
+    if (tsConfig?.enabled) {
+      enabled.push({
+        id: p.id,
+        name: p.name,
+        brand: p.brand_name || p.supplier_name || '',
+        sku: p.sku || '',
+        retailPrice: parseFloat(p.price_including_tax || p.price || 0),
+        teamPrice: tsConfig.teamPrice || 0,
+        stock: p.inventory?.[0]?.current_amount ?? p.current_inventory ?? 0,
+        imageUrl: p.image_url || p.images?.[0]?.url || null
+      });
+    }
+  }
+  return json(enabled);
 }
+
 async function apiAdminGetConfig(env) { return json(await getConfig(env)); }
+
 async function apiAdminSaveConfig(request, env) {
   const data = await request.json();
   const existing = await getConfig(env);
@@ -266,54 +738,32 @@ async function apiAdminSaveConfig(request, env) {
   return json(config);
 }
 
-// Custom variant attributes
-async function apiGetCustomAttributes(env) {
-  const attrs = await env.STORE_DATA.get('store:custom_attributes', 'json') || [];
-  return json(attrs);
-}
-async function apiSaveCustomAttribute(request, env) {
-  const { name } = await request.json();
-  if (!name) return json({ error: 'Name required' }, 400);
-  const attrs = await env.STORE_DATA.get('store:custom_attributes', 'json') || [];
-  if (!attrs.includes(name)) { attrs.push(name); await env.STORE_DATA.put('store:custom_attributes', JSON.stringify(attrs)); }
-  return json(attrs);
-}
+// ============================================================
+// CRON SYNC
+// ============================================================
+async function cronSyncProducts(env) {
+  if (!env.LIGHTSPEED_API_TOKEN) return;
+  try {
+    const products = await lsFetchAll(env, 'products?page_size=100');
+    await env.STORE_DATA.put('ls_products_cache', JSON.stringify(products));
+    await env.STORE_DATA.put('ls_sync_timestamp', new Date().toISOString());
 
-async function apiAdminSeed(env) {
-  const categories = [
-    { id: 'cat_sticks', name: 'Sticks', description: 'Hockey sticks for all levels', image: '', order: 1, active: true },
-    { id: 'cat_helmets', name: 'Helmets', description: 'Protective helmets and cages', image: '', order: 2, active: true },
-    { id: 'cat_gloves', name: 'Gloves', description: 'Hockey gloves', image: '', order: 3, active: true },
-    { id: 'cat_protective', name: 'Protective', description: 'Shin guards, shoulder pads, pants', image: '', order: 4, active: true },
-    { id: 'cat_apparel', name: 'Apparel', description: 'Team apparel and accessories', image: '', order: 5, active: true }
-  ];
-  const products = [
-    { id: 'prod_stick1', name: 'Bauer Nexus E5 Pro Stick', description: 'Top-tier performance stick with enhanced puck feel.', category: 'cat_sticks', price: 289.99, supplyPrice: 195.00, supplier: 'Bauer', supplierCode: 'BAU-NE5P', images: [], active: true,
-      variantTypes: [{ name: 'Hand', options: ['Left', 'Right'] }, { name: 'Flex', options: ['75', '85', '95'] }, { name: 'Curve', options: ['P92', 'P88', 'P28'] }],
-      variants: [{ id: 'var_s1a', sku: 'BAU-NE5P-L85-P92', supplierCode: '', supplyPrice: 195, retailPrice: 289.99, options: { Hand: 'Left', Flex: '85', Curve: 'P92' }, stock: 5, enabled: true }, { id: 'var_s1b', sku: 'BAU-NE5P-R85-P92', supplierCode: '', supplyPrice: 195, retailPrice: 289.99, options: { Hand: 'Right', Flex: '85', Curve: 'P92' }, stock: 3, enabled: true }, { id: 'var_s1c', sku: 'BAU-NE5P-L75-P88', supplierCode: '', supplyPrice: 195, retailPrice: 289.99, options: { Hand: 'Left', Flex: '75', Curve: 'P88' }, stock: 2, enabled: true }] },
-    { id: 'prod_stick2', name: 'CCM Jetspeed FT6 Pro', description: 'Lightweight and responsive for quick release.', category: 'cat_sticks', price: 319.99, supplyPrice: 215.00, supplier: 'CCM', supplierCode: 'CCM-JFT6', images: [], active: true,
-      variantTypes: [{ name: 'Hand', options: ['Left', 'Right'] }, { name: 'Flex', options: ['75', '85', '95'] }, { name: 'Curve', options: ['P29', 'P90', 'P28'] }],
-      variants: [{ id: 'var_s2a', sku: 'CCM-JFT6-L85-P29', supplierCode: '', supplyPrice: 215, retailPrice: 319.99, options: { Hand: 'Left', Flex: '85', Curve: 'P29' }, stock: 4, enabled: true }, { id: 'var_s2b', sku: 'CCM-JFT6-R95-P90', supplierCode: '', supplyPrice: 215, retailPrice: 319.99, options: { Hand: 'Right', Flex: '95', Curve: 'P90' }, stock: 2, enabled: true }] },
-    { id: 'prod_helmet1', name: 'Bauer Re-Akt 85 Helmet', description: 'Premium protection with comfort fit system.', category: 'cat_helmets', price: 159.99, supplyPrice: 99.00, supplier: 'Bauer', supplierCode: 'BAU-RA85', images: [], active: true,
-      variantTypes: [{ name: 'Size', options: ['Small', 'Medium', 'Large'] }, { name: 'Color', options: ['Black', 'White', 'Navy'] }],
-      variants: [{ id: 'var_h1a', sku: 'BAU-RA85-M-BLK', supplierCode: '', supplyPrice: 99, retailPrice: 159.99, options: { Size: 'Medium', Color: 'Black' }, stock: 6, enabled: true }, { id: 'var_h1b', sku: 'BAU-RA85-L-BLK', supplierCode: '', supplyPrice: 99, retailPrice: 159.99, options: { Size: 'Large', Color: 'Black' }, stock: 4, enabled: true }, { id: 'var_h1c', sku: 'BAU-RA85-M-WHT', supplierCode: '', supplyPrice: 99, retailPrice: 159.99, options: { Size: 'Medium', Color: 'White' }, stock: 3, enabled: true }] },
-    { id: 'prod_gloves1', name: 'Warrior Alpha LX2 Gloves', description: 'Lightweight gloves with great feel and protection.', category: 'cat_gloves', price: 129.99, supplyPrice: 78.00, supplier: 'Warrior', supplierCode: 'WAR-ALX2', images: [], active: true,
-      variantTypes: [{ name: 'Size', options: ['13"', '14"', '15"'] }, { name: 'Color', options: ['Black', 'Navy', 'Red'] }],
-      variants: [{ id: 'var_g1a', sku: 'WAR-ALX2-14-BLK', supplierCode: '', supplyPrice: 78, retailPrice: 129.99, options: { Size: '14"', Color: 'Black' }, stock: 8, enabled: true }, { id: 'var_g1b', sku: 'WAR-ALX2-13-NAV', supplierCode: '', supplyPrice: 78, retailPrice: 129.99, options: { Size: '13"', Color: 'Navy' }, stock: 5, enabled: true }] },
-    { id: 'prod_shins1', name: 'CCM Tacks AS-V Shin Guards', description: 'Pro-level shin protection with anatomical fit.', category: 'cat_protective', price: 89.99, supplyPrice: 52.00, supplier: 'CCM', supplierCode: 'CCM-ASV-SG', images: [], active: true,
-      variantTypes: [{ name: 'Size', options: ['13"', '14"', '15"', '16"'] }],
-      variants: [{ id: 'var_p1a', sku: 'CCM-ASV-SG-14', supplierCode: '', supplyPrice: 52, retailPrice: 89.99, options: { Size: '14"' }, stock: 10, enabled: true }, { id: 'var_p1b', sku: 'CCM-ASV-SG-15', supplierCode: '', supplyPrice: 52, retailPrice: 89.99, options: { Size: '15"' }, stock: 7, enabled: true }] },
-    { id: 'prod_hoodie1', name: 'Ice Lab Team Hoodie', description: 'Heavyweight fleece hoodie with embroidered Ice Lab logo.', category: 'cat_apparel', price: 54.99, supplyPrice: 22.00, supplier: 'Ice Lab', supplierCode: 'ICE-HOOD', images: [], active: true,
-      variantTypes: [{ name: 'Size', options: ['S', 'M', 'L', 'XL', '2XL'] }, { name: 'Color', options: ['Black', 'Charcoal', 'Navy'] }],
-      variants: [{ id: 'var_a1a', sku: 'ICE-HOOD-M-BLK', supplierCode: '', supplyPrice: 22, retailPrice: 54.99, options: { Size: 'M', Color: 'Black' }, stock: 15, enabled: true }, { id: 'var_a1b', sku: 'ICE-HOOD-L-BLK', supplierCode: '', supplyPrice: 22, retailPrice: 54.99, options: { Size: 'L', Color: 'Black' }, stock: 12, enabled: true }, { id: 'var_a1c', sku: 'ICE-HOOD-XL-CHA', supplierCode: '', supplyPrice: 22, retailPrice: 54.99, options: { Size: 'XL', Color: 'Charcoal' }, stock: 8, enabled: true }] }
-  ];
-  const catIds = categories.map(c => c.id);
-  await env.STORE_DATA.put('categories', JSON.stringify(catIds));
-  for (const cat of categories) { cat.createdAt = new Date().toISOString(); cat.updatedAt = new Date().toISOString(); await env.STORE_DATA.put(`category:${cat.id}`, JSON.stringify(cat)); }
-  const prodIds = products.map(p => p.id);
-  await env.STORE_DATA.put('products', JSON.stringify(prodIds));
-  for (const prod of products) { prod.createdAt = new Date().toISOString(); prod.updatedAt = new Date().toISOString(); await env.STORE_DATA.put(`product:${prod.id}`, JSON.stringify(prod)); }
-  return json({ success: true, categories: catIds.length, products: prodIds.length });
+    // Update enabled products
+    for (const p of products) {
+      const configKey = `ts_enabled:${p.id}`;
+      const existing = await env.STORE_DATA.get(configKey, 'json');
+      if (existing && existing.enabled) {
+        existing.currentStock = p.inventory?.[0]?.current_amount ?? p.current_inventory ?? 0;
+        existing.retailPrice = parseFloat(p.price_including_tax || p.price || 0);
+        existing.name = p.name;
+        existing.updatedAt = new Date().toISOString();
+        await env.STORE_DATA.put(configKey, JSON.stringify(existing));
+      }
+    }
+    console.log(`Cron sync complete: ${products.length} products synced at ${new Date().toISOString()}`);
+  } catch (e) {
+    console.error('Cron sync failed:', e.message);
+  }
 }
 
 // ============================================================
@@ -325,7 +775,6 @@ const ICONS = {
   edit: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>',
   orders: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/></svg>',
   products: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m7.5 4.27 9 5.15"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg>',
-  categories: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg>',
   settings: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>',
   camera: '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#c0c4cc" stroke-width="1.5"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3Z"/><circle cx="12" cy="13" r="3"/></svg>',
   back: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6"/></svg>',
@@ -333,8 +782,9 @@ const ICONS = {
   x: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>',
   check: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg>',
   store: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m2 7 4.41-4.41A2 2 0 0 1 7.83 2h8.34a2 2 0 0 1 1.42.59L22 7"/><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><path d="M15 22v-4a2 2 0 0 0-2-2h-2a2 2 0 0 0-2 2v4"/><path d="M2 7h20"/><path d="M22 7v3a2 2 0 0 1-2 2a2.7 2.7 0 0 1-1.59-.63.7.7 0 0 0-.82 0A2.7 2.7 0 0 1 16 12a2.7 2.7 0 0 1-1.59-.63.7.7 0 0 0-.82 0A2.7 2.7 0 0 1 12 12a2.7 2.7 0 0 1-1.59-.63.7.7 0 0 0-.82 0A2.7 2.7 0 0 1 8 12a2.7 2.7 0 0 1-1.59-.63.7.7 0 0 0-.82 0A2.7 2.7 0 0 1 4 12a2 2 0 0 1-2-2V7"/></svg>',
-  trash: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>',
-  upload: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg>',
+  importIcon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>',
+  sync: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>',
+  link: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>',
 };
 
 // ============================================================
@@ -349,16 +799,17 @@ function storePage() {
 .sh{background:#fff;border-bottom:1px solid #e5e7eb;padding:0 24px;height:60px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;box-shadow:0 1px 3px rgba(0,0,0,0.04)}.sh-brand{font-size:16px;font-weight:700;color:#1a1a2e;letter-spacing:0.5px;cursor:pointer}.cart-btn{position:relative;background:#fff;border:1px solid #e5e7eb;color:#1a1a2e;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:500;display:flex;align-items:center;gap:6px;transition:all 0.15s}.cart-btn:hover{border-color:#d1d5db;background:#f9fafb}.cart-badge{background:#4f46e5;color:#fff;font-size:11px;font-weight:700;border-radius:50%;width:18px;height:18px;display:flex;align-items:center;justify-content:center}
 .sc{max-width:1200px;margin:0 auto;padding:32px 24px}.st{font-size:20px;font-weight:700;margin-bottom:20px;color:#1a1a2e}
 .cg{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;margin-bottom:40px}.cc{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:24px;cursor:pointer;transition:all 0.15s;text-align:center}.cc:hover{border-color:#d1d5db;box-shadow:0 1px 3px rgba(0,0,0,0.08);transform:translateY(-1px)}.cc h3{font-size:15px;font-weight:600;margin-bottom:4px;color:#1a1a2e}.cc p{font-size:13px;color:#6b7280}
-.pg{display:grid;grid-template-columns:repeat(4,1fr);gap:20px}.pc{background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;cursor:pointer;transition:all 0.15s}.pc:hover{box-shadow:0 4px 12px rgba(0,0,0,0.08);transform:translateY(-2px)}.pc-img{height:200px;background:#f0f1f3;display:flex;align-items:center;justify-content:center}.pc-img img{width:100%;height:100%;object-fit:cover}.pc-info{padding:14px 16px}.pc-info h3{font-size:14px;font-weight:600;margin-bottom:6px;color:#1a1a2e;line-height:1.3}.pc-price-row{display:flex;align-items:center;justify-content:space-between}.pc-price{font-size:16px;font-weight:700;color:#1a1a2e}.stock-dot{width:8px;height:8px;border-radius:50%;display:inline-block}.stock-green{background:#16a34a}.stock-yellow{background:#f59e0b}.stock-red{background:#dc2626}
-.pd{background:#fff;border-radius:8px;border:1px solid #e5e7eb;padding:32px;box-shadow:0 1px 3px rgba(0,0,0,0.08)}.pd-layout{display:grid;grid-template-columns:400px 1fr;gap:40px}.pd-image{height:400px;background:#f0f1f3;border-radius:8px;display:flex;align-items:center;justify-content:center;overflow:hidden}.pd-image img{width:100%;height:100%;object-fit:cover}.pd-info h2{font-size:22px;font-weight:700;margin-bottom:8px}.pd-info .price{font-size:24px;font-weight:700;color:#1a1a2e;margin-bottom:16px}.pd-info .desc{color:#6b7280;margin-bottom:24px;line-height:1.6;font-size:14px}
+.pg{display:grid;grid-template-columns:repeat(4,1fr);gap:20px}.pc{background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;cursor:pointer;transition:all 0.15s}.pc:hover{box-shadow:0 4px 12px rgba(0,0,0,0.08);transform:translateY(-2px)}.pc-img{height:200px;background:#f0f1f3;display:flex;align-items:center;justify-content:center}.pc-img img{width:100%;height:100%;object-fit:cover}.pc-info{padding:14px 16px}.pc-info h3{font-size:14px;font-weight:600;margin-bottom:4px;color:#1a1a2e;line-height:1.3}.pc-brand{font-size:11px;color:#6b7280;margin-bottom:6px}.pc-price-row{display:flex;align-items:center;justify-content:space-between;gap:8px}.pc-price{font-size:16px;font-weight:700;color:#1a1a2e}.pc-retail{font-size:12px;color:#9ca3af;text-decoration:line-through}.stock-badge{font-size:10px;font-weight:600;padding:2px 8px;border-radius:4px;white-space:nowrap}.stock-instock{background:#f0fdf4;color:#16a34a}.stock-order{background:#eff6ff;color:#2563eb}
+.pd{background:#fff;border-radius:8px;border:1px solid #e5e7eb;padding:32px;box-shadow:0 1px 3px rgba(0,0,0,0.08)}.pd-layout{display:grid;grid-template-columns:400px 1fr;gap:40px}.pd-image{height:400px;background:#f0f1f3;border-radius:8px;display:flex;align-items:center;justify-content:center;overflow:hidden}.pd-image img{width:100%;height:100%;object-fit:cover}.pd-info h2{font-size:22px;font-weight:700;margin-bottom:4px}.pd-brand{font-size:13px;color:#6b7280;margin-bottom:12px}.pd-info .price{font-size:24px;font-weight:700;color:#1a1a2e;margin-bottom:4px}.pd-info .retail-price{font-size:14px;color:#9ca3af;text-decoration:line-through;margin-bottom:16px}.pd-info .desc{color:#6b7280;margin-bottom:24px;line-height:1.6;font-size:14px}
 .vg{margin-bottom:16px}.vg label{display:block;font-size:12px;color:#6b7280;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px}.vg select{width:100%;padding:10px 12px;background:#fff;border:1px solid #d1d5db;border-radius:6px;color:#1a1a2e;font-size:14px;cursor:pointer;transition:border 0.15s}.vg select:focus{border-color:#4f46e5;outline:none;box-shadow:0 0 0 3px rgba(79,70,229,0.1)}
 .qty-row{display:flex;align-items:center;gap:12px;margin-bottom:20px}.qty-btn{width:36px;height:36px;border-radius:6px;border:1px solid #d1d5db;background:#fff;color:#1a1a2e;font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.15s}.qty-btn:hover{background:#f9fafb}.qty-val{font-size:16px;font-weight:600;min-width:30px;text-align:center}
-.stock-indicator{font-size:13px;padding:4px 10px;border-radius:4px;display:inline-block;margin-bottom:16px;font-weight:500}.si-green{background:#f0fdf4;color:#16a34a}.si-yellow{background:#fffbeb;color:#d97706}.si-red{background:#fef2f2;color:#dc2626}
+.stock-indicator{font-size:13px;padding:4px 10px;border-radius:4px;display:inline-block;margin-bottom:16px;font-weight:500}.si-green{background:#f0fdf4;color:#16a34a}.si-blue{background:#eff6ff;color:#2563eb}
 .back-link{display:inline-flex;align-items:center;gap:4px;color:#6b7280;font-size:13px;margin-bottom:16px;cursor:pointer;font-weight:500;transition:color 0.15s}.back-link:hover{color:#1a1a2e}
-.btn{padding:10px 20px;border-radius:6px;border:none;font-size:14px;font-weight:500;cursor:pointer;transition:all 0.15s;display:inline-flex;align-items:center;justify-content:center;gap:6px}.btn-primary{background:#4f46e5;color:#fff}.btn-primary:hover{background:#4338ca}.btn-primary:disabled{background:#c7d2fe;color:#818cf8;cursor:not-allowed}.btn-outline{background:#fff;border:1px solid #d1d5db;color:#374151}.btn-outline:hover{background:#f9fafb}.btn-full{width:100%}.btn-lg{padding:14px 24px;font-size:15px;font-weight:600}
+.btn{padding:10px 20px;border-radius:6px;border:none;font-size:14px;font-weight:500;cursor:pointer;transition:all 0.15s;display:inline-flex;align-items:center;justify-content:center;gap:6px}.btn-primary{background:#4f46e5;color:#fff}.btn-primary:hover{background:#4338ca}.btn-primary:disabled{background:#c7d2fe;color:#818cf8;cursor:not-allowed}.btn-full{width:100%}.btn-lg{padding:14px 24px;font-size:15px;font-weight:600}
 .co{position:fixed;inset:0;background:rgba(0,0,0,0.3);z-index:200;display:none}.co.open{display:block}.cs{position:fixed;top:0;right:0;bottom:0;width:400px;max-width:90vw;background:#fff;border-left:1px solid #e5e7eb;z-index:201;display:flex;flex-direction:column;transform:translateX(100%);transition:transform 0.25s ease}.cs.open{transform:translateX(0)}.cs-header{padding:16px 20px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between}.cs-header h2{font-size:16px;font-weight:600}.cs-close{background:none;border:none;color:#6b7280;cursor:pointer;padding:4px}.cs-close:hover{color:#1a1a2e}.cs-items{flex:1;overflow-y:auto;padding:16px 20px}.ci{display:flex;gap:12px;padding:14px 0;border-bottom:1px solid #f0f0f0}.ci-info{flex:1}.ci-info h4{font-size:14px;font-weight:600;margin-bottom:2px}.ci-info .opts{font-size:12px;color:#6b7280}.ci-info .ip{font-size:14px;color:#1a1a2e;font-weight:600;margin-top:4px}.ci-qty{display:flex;align-items:center;gap:6px}.ci-qty button{width:26px;height:26px;border-radius:4px;border:1px solid #d1d5db;background:#fff;color:#1a1a2e;cursor:pointer;font-size:13px;transition:all 0.15s}.ci-qty button:hover{background:#f9fafb}.ci-remove{background:none;border:none;color:#dc2626;font-size:12px;cursor:pointer;margin-top:4px;font-weight:500}.ci-remove:hover{text-decoration:underline}.cs-empty{text-align:center;color:#6b7280;padding:40px;font-size:14px}.cs-footer{padding:20px;border-top:1px solid #e5e7eb}.cs-total{display:flex;justify-content:space-between;font-size:16px;font-weight:700;margin-bottom:16px}
 .co-form input{width:100%;padding:10px 12px;margin-bottom:8px;background:#fff;border:1px solid #d1d5db;border-radius:6px;color:#1a1a2e;font-size:14px;font-family:inherit;transition:border 0.15s}.co-form input:focus{border-color:#4f46e5;outline:none;box-shadow:0 0 0 3px rgba(79,70,229,0.1)}.co-form input::placeholder{color:#9ca3af}
 .toast{position:fixed;bottom:24px;right:24px;background:#1a1a2e;color:#fff;padding:10px 18px;border-radius:6px;font-size:13px;font-weight:500;z-index:300;transform:translateY(60px);opacity:0;transition:all 0.25s}.toast.show{transform:translateY(0);opacity:1}
+.loading{text-align:center;padding:60px;color:#6b7280;font-size:14px}
 @media(max-width:900px){.pg{grid-template-columns:repeat(2,1fr)}.pd-layout{grid-template-columns:1fr}}
 @media(max-width:480px){.pg{grid-template-columns:1fr}.cg{grid-template-columns:repeat(2,1fr)}}
 </style></head><body>
@@ -371,33 +822,165 @@ function storePage() {
 <div class="toast" id="toast"></div>
 <script>
 let categories=[],products=[],cart=JSON.parse(localStorage.getItem('icelab_cart')||'[]'),currentView='home',prevCategory=null;
+
 const pinInputs=document.querySelectorAll('.pin-dots input');
 pinInputs.forEach((inp,i)=>{inp.addEventListener('input',()=>{if(inp.value&&i<pinInputs.length-1)pinInputs[i+1].focus();if(i===pinInputs.length-1&&inp.value)checkPin()});inp.addEventListener('keydown',e=>{if(e.key==='Backspace'&&!inp.value&&i>0)pinInputs[i-1].focus()})});
 async function checkPin(){const pin=Array.from(pinInputs).map(i=>i.value).join('');if(pin.length<4)return;try{const r=await fetch('/api/verify-pin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin})});if(r.ok){sessionStorage.setItem('store_pin',pin);document.getElementById('pin-screen').style.display='none';document.getElementById('store-app').style.display='';loadStore()}else{document.getElementById('pin-error').textContent='Invalid PIN';pinInputs.forEach(i=>i.value='');pinInputs[0].focus()}}catch(e){document.getElementById('pin-error').textContent='Connection error'}}
 if(sessionStorage.getItem('store_pin')){document.getElementById('pin-screen').style.display='none';document.getElementById('store-app').style.display='';loadStore()}
-async function loadStore(){const[cr,pr]=await Promise.all([fetch('/api/categories'),fetch('/api/products')]);categories=await cr.json();products=await pr.json();updateCartCount();showHome()}
-function showHome(){currentView='home';prevCategory=null;const m=document.getElementById('main-content');m.innerHTML='<h2 class="st">Categories</h2><div class="cg">'+categories.map(c=>'<div class="cc" onclick="showCategory(\\''+c.id+'\\')"><h3>'+esc(c.name)+'</h3><p>'+esc(c.description)+'</p></div>').join('')+'</div><h2 class="st">All Products</h2><div class="pg">'+products.map(productCard).join('')+'</div>'}
-function showCategory(catId){currentView='category';prevCategory=catId;const cat=categories.find(c=>c.id===catId);const filtered=products.filter(p=>p.category===catId);const m=document.getElementById('main-content');m.innerHTML='<a class="back-link" onclick="showHome()">${ICONS.back} All Categories</a><h2 class="st">'+esc(cat.name)+'</h2>'+(filtered.length?'<div class="pg">'+filtered.map(productCard).join('')+'</div>':'<p style="color:#6b7280">No products in this category yet.</p>')}
-function productCard(p){const enabledVars=(p.variants||[]).filter(v=>v.enabled!==false);const ts=enabledVars.reduce((s,v)=>s+(v.stock??0),0);let sd='';if(enabledVars.length>0){if(ts===0)sd='<span class="stock-dot stock-red"></span>';else if(ts<=3)sd='<span class="stock-dot stock-yellow"></span>';else sd='<span class="stock-dot stock-green"></span>'}const img=p.images?.[0]?'<img src="'+esc(p.images[0])+'">':'${ICONS.camera}';return '<div class="pc" onclick="showProduct(\\''+p.id+'\\')"><div class="pc-img">'+img+'</div><div class="pc-info"><h3>'+esc(p.name)+'</h3><div class="pc-price-row"><span class="pc-price">$'+p.price.toFixed(2)+'</span>'+sd+'</div></div></div>'}
-function showProduct(prodId){currentView='product';const p=products.find(x=>x.id===prodId);if(!p)return;const img=p.images?.[0]?'<img src="'+esc(p.images[0])+'">':'${ICONS.camera}';const enabledVars=(p.variants||[]).filter(v=>v.enabled!==false);const vs=(p.variantTypes||[]).map(vt=>'<div class="vg"><label>'+esc(vt.name)+'</label><select onchange="updateVariantStock()" data-variant="'+esc(vt.name)+'"><option value="">Select '+esc(vt.name)+'</option>'+vt.options.map(o=>{const hasEnabled=enabledVars.some(v=>v.options[vt.name]===o);return '<option value="'+esc(o)+'"'+(hasEnabled?'':' disabled')+'>'+esc(o)+(hasEnabled?'':' (unavailable)')+'</option>'}).join('')+'</select></div>').join('');
-const m=document.getElementById('main-content');m.innerHTML='<a class="back-link" onclick="goBack()">${ICONS.back} Back</a><div class="pd"><div class="pd-layout"><div class="pd-image">'+img+'</div><div class="pd-info"><h2>'+esc(p.name)+'</h2><div class="price" id="pd-price">$'+p.price.toFixed(2)+'</div><p class="desc">'+esc(p.description)+'</p>'+vs+'<div id="pd-stock-info"></div><div class="qty-row"><span style="color:#6b7280;font-size:13px;font-weight:500">Qty</span><button class="qty-btn" onclick="changeQty(-1)">-</button><span class="qty-val" id="pd-qty">1</span><button class="qty-btn" onclick="changeQty(1)">+</button></div><button class="btn btn-primary btn-full btn-lg" id="btn-add" onclick="addToCart(\\''+p.id+'\\')"'+(p.variantTypes?.length?' disabled':'')+'>Add to Cart</button></div></div></div>';window._pdQty=1;window._currentProduct=p}
-function goBack(){if(currentView==='product'&&prevCategory){showCategory(prevCategory)}else{showHome()}}
+
+async function loadStore(){
+  document.getElementById('main-content').innerHTML='<div class="loading">Loading products...</div>';
+  const[cr,pr]=await Promise.all([fetch('/api/categories'),fetch('/api/products')]);
+  categories=await cr.json();
+  products=await pr.json();
+  updateCartCount();
+  showHome();
+}
+
+function showHome(){
+  currentView='home';prevCategory=null;
+  const m=document.getElementById('main-content');
+  let html='';
+  if(categories.length>1){
+    html+='<h2 class="st">Categories</h2><div class="cg">'+categories.map(c=>'<div class="cc" onclick="showCategory(\\''+esc(c.id)+'\\')"><h3>'+esc(c.name)+'</h3><p>'+c.count+' product'+(c.count!==1?'s':'')+'</p></div>').join('')+'</div>';
+  }
+  html+='<h2 class="st">All Products</h2>';
+  if(products.length===0){html+='<div class="loading">No products available yet. Check back soon!</div>'}
+  else{html+='<div class="pg">'+products.map(productCard).join('')+'</div>'}
+  m.innerHTML=html;
+}
+
+function showCategory(catId){
+  currentView='category';prevCategory=catId;
+  const cat=categories.find(c=>c.id===catId);
+  const filtered=products.filter(p=>p.type===catId);
+  const m=document.getElementById('main-content');
+  m.innerHTML='<a class="back-link" onclick="showHome()">${ICONS.back} All Categories</a><h2 class="st">'+esc(cat?.name||catId)+'</h2>'+(filtered.length?'<div class="pg">'+filtered.map(productCard).join('')+'</div>':'<p style="color:#6b7280">No products in this category yet.</p>');
+}
+
+function productCard(p){
+  const stock=p.totalStock||p.stock||0;
+  const stockBadge=stock>0?'<span class="stock-badge stock-instock">In Stock</span>':'<span class="stock-badge stock-order">Available to Order</span>';
+  const img=p.imageUrl?'<img src="'+esc(p.imageUrl)+'">':'${ICONS.camera}';
+  const teamPrice=p.teamPrice||p.price||0;
+  const retailPrice=p.retailPrice||0;
+  return '<div class="pc" onclick="showProduct(\\''+p.id+'\\')"><div class="pc-img">'+img+'</div><div class="pc-info">'+(p.brand?'<div class="pc-brand">'+esc(p.brand)+'</div>':'')+'<h3>'+esc(p.name)+'</h3><div class="pc-price-row"><div><span class="pc-price">$'+teamPrice.toFixed(2)+'</span>'+(retailPrice>teamPrice?' <span class="pc-retail">$'+retailPrice.toFixed(2)+'</span>':'')+'</div>'+stockBadge+'</div></div></div>';
+}
+
+async function showProduct(prodId){
+  currentView='product';
+  document.getElementById('main-content').innerHTML='<div class="loading">Loading...</div>';
+  const r=await fetch('/api/product/'+prodId);
+  if(!r.ok){showHome();return}
+  const p=await r.json();
+  window._currentProduct=p;
+  window._pdQty=1;
+
+  const img=p.imageUrl?'<img src="'+esc(p.imageUrl)+'">':'${ICONS.camera}';
+  const stock=p.stock||0;
+  const stockHtml=stock>0?'<span class="stock-indicator si-green">In Stock - Available Now</span>':'<span class="stock-indicator si-blue">Available to Order - 1-2 Weeks</span>';
+
+  let variantHtml='';
+  if(p.variants&&p.variants.length>0){
+    variantHtml='<div class="vg"><label>Options</label><select id="variant-select" onchange="onVariantChange()"><option value="">Select an option</option>'+p.variants.map(v=>'<option value="'+v.id+'" data-stock="'+(v.stock||0)+'" data-team="'+(v.teamPrice||0)+'" data-retail="'+(v.retailPrice||0)+'">'+esc(v.name)+(v.stock>0?' (In Stock)':' (Available to Order)')+'</option>').join('')+'</select></div>';
+  }
+
+  const m=document.getElementById('main-content');
+  m.innerHTML='<a class="back-link" onclick="goBack()">${ICONS.back} Back</a><div class="pd"><div class="pd-layout"><div class="pd-image">'+img+'</div><div class="pd-info"><h2>'+esc(p.name)+'</h2>'+(p.brand?'<div class="pd-brand">'+esc(p.brand)+'</div>':'')+'<div class="price" id="pd-price">$'+(p.teamPrice||0).toFixed(2)+'</div>'+(p.retailPrice>p.teamPrice?'<div class="retail-price" id="pd-retail">$'+p.retailPrice.toFixed(2)+'</div>':'')+'<p class="desc">'+esc(p.description)+'</p>'+variantHtml+'<div id="pd-stock-info">'+stockHtml+'</div><div class="qty-row"><span style="color:#6b7280;font-size:13px;font-weight:500">Qty</span><button class="qty-btn" onclick="changeQty(-1)">-</button><span class="qty-val" id="pd-qty">1</span><button class="qty-btn" onclick="changeQty(1)">+</button></div><button class="btn btn-primary btn-full btn-lg" id="btn-add" onclick="addToCart()"'+(p.variants&&p.variants.length?' disabled':'')+'>Add to Cart</button></div></div></div>';
+}
+
+function onVariantChange(){
+  const sel=document.getElementById('variant-select');
+  if(!sel)return;
+  const opt=sel.options[sel.selectedIndex];
+  const btn=document.getElementById('btn-add');
+  if(!sel.value){btn.disabled=true;return}
+  btn.disabled=false;
+  const stock=parseInt(opt.dataset.stock)||0;
+  const teamPrice=parseFloat(opt.dataset.team)||0;
+  const retailPrice=parseFloat(opt.dataset.retail)||0;
+  document.getElementById('pd-price').textContent='$'+teamPrice.toFixed(2);
+  const retailEl=document.getElementById('pd-retail');
+  if(retailEl){retailEl.textContent=retailPrice>teamPrice?'$'+retailPrice.toFixed(2):''}
+  const si=document.getElementById('pd-stock-info');
+  si.innerHTML=stock>0?'<span class="stock-indicator si-green">In Stock - Available Now</span>':'<span class="stock-indicator si-blue">Available to Order - 1-2 Weeks</span>';
+}
+
+function goBack(){if(currentView==='product'&&prevCategory)showCategory(prevCategory);else showHome()}
 function changeQty(d){window._pdQty=Math.max(1,(window._pdQty||1)+d);document.getElementById('pd-qty').textContent=window._pdQty}
-function updateVariantStock(){const p=window._currentProduct;if(!p)return;const sels=document.querySelectorAll('[data-variant]');const sel={};let allSel=true;sels.forEach(s=>{if(s.value)sel[s.dataset.variant]=s.value;else allSel=false});const btn=document.getElementById('btn-add'),si=document.getElementById('pd-stock-info');if(!allSel){btn.disabled=true;si.innerHTML='';return}const enabledVars=(p.variants||[]).filter(v=>v.enabled!==false);const v=enabledVars.find(v=>Object.entries(sel).every(([k,val])=>v.options[k]===val));if(v){const st=v.stock??0;if(st===0){si.innerHTML='<span class="stock-indicator si-red">Out of Stock</span>';btn.disabled=true}else if(st<=3){si.innerHTML='<span class="stock-indicator si-yellow">Low Stock - Only '+st+' left</span>';btn.disabled=false}else{si.innerHTML='<span class="stock-indicator si-green">In Stock</span>';btn.disabled=false}const rp=v.retailPrice||v.price||p.price;document.getElementById('pd-price').textContent='$'+rp.toFixed(2)}else{si.innerHTML='<span class="stock-indicator si-red">Unavailable</span>';btn.disabled=true}}
-function addToCart(prodId){const p=products.find(x=>x.id===prodId);if(!p)return;const sels=document.querySelectorAll('[data-variant]');const opts={};sels.forEach(s=>{if(s.value)opts[s.dataset.variant]=s.value});const enabledVars=(p.variants||[]).filter(v=>v.enabled!==false);const variant=enabledVars.find(v=>Object.entries(opts).every(([k,val])=>v.options[k]===val));const price=variant?.retailPrice||variant?.price||p.price;const ci={productId:p.id,variantId:variant?.id||null,name:p.name,options:opts,price,qty:window._pdQty||1};const ei=cart.findIndex(c=>c.productId===ci.productId&&c.variantId===ci.variantId);if(ei>=0)cart[ei].qty+=ci.qty;else cart.push(ci);saveCart();showToast('Added to cart')}
+
+function addToCart(){
+  const p=window._currentProduct;
+  if(!p)return;
+  const varSel=document.getElementById('variant-select');
+  let selectedVariant=null;
+  let teamPrice=p.teamPrice||0;
+  let variantName='';
+  let lightspeedId=p.id;
+
+  if(varSel&&varSel.value){
+    selectedVariant=p.variants.find(v=>v.id===varSel.value);
+    if(selectedVariant){
+      teamPrice=selectedVariant.teamPrice||teamPrice;
+      variantName=selectedVariant.name||'';
+      lightspeedId=selectedVariant.id;
+    }
+  }
+
+  const ci={
+    productId:p.id,
+    lightspeedId:lightspeedId,
+    name:p.name,
+    variantName:variantName,
+    teamPrice:teamPrice,
+    price:teamPrice,
+    qty:window._pdQty||1,
+    imageUrl:p.imageUrl||null
+  };
+  const ei=cart.findIndex(c=>c.lightspeedId===ci.lightspeedId);
+  if(ei>=0)cart[ei].qty+=ci.qty;
+  else cart.push(ci);
+  saveCart();
+  showToast('Added to cart');
+}
+
 function saveCart(){localStorage.setItem('icelab_cart',JSON.stringify(cart));updateCartCount()}
 function updateCartCount(){document.getElementById('cart-count').textContent=cart.reduce((s,i)=>s+i.qty,0)}
 function toggleCart(){const o=document.getElementById('cart-overlay'),s=document.getElementById('cart-sidebar');if(s.classList.contains('open')){o.classList.remove('open');s.classList.remove('open')}else{renderCart();o.classList.add('open');s.classList.add('open')}}
-function renderCart(){const ie=document.getElementById('cart-items'),fe=document.getElementById('cart-footer');if(!cart.length){ie.innerHTML='<div class="cs-empty">Your cart is empty</div>';fe.innerHTML='';return}ie.innerHTML=cart.map((c,i)=>{const os=Object.values(c.options||{}).join(', ');return '<div class="ci"><div class="ci-info"><h4>'+esc(c.name)+'</h4>'+(os?'<div class="opts">'+esc(os)+'</div>':'')+'<div class="ip">$'+(c.price*c.qty).toFixed(2)+'</div></div><div style="text-align:right"><div class="ci-qty"><button onclick="updateCartQty('+i+',-1)">-</button><span>'+c.qty+'</span><button onclick="updateCartQty('+i+',1)">+</button></div><button class="ci-remove" onclick="removeCartItem('+i+')">Remove</button></div></div>'}).join('');const total=cart.reduce((s,c)=>s+c.price*c.qty,0);fe.innerHTML='<div class="cs-total"><span>Total</span><span>$'+total.toFixed(2)+'</span></div><div class="co-form"><input type="text" id="co-name" placeholder="Full Name" value="'+esc(sessionStorage.getItem('co_name')||'')+'"><input type="email" id="co-email" placeholder="Email" value="'+esc(sessionStorage.getItem('co_email')||'')+'"><input type="tel" id="co-phone" placeholder="Phone" value="'+esc(sessionStorage.getItem('co_phone')||'')+'"><p style="font-size:12px;color:#6b7280;margin:8px 0">Local pickup only</p><button class="btn btn-primary btn-full" onclick="checkout()" id="checkout-btn">Checkout &middot; $'+total.toFixed(2)+'</button></div>'}
-function updateCartQty(i,d){cart[i].qty=Math.max(1,cart[i].qty+d);saveCart();renderCart()}function removeCartItem(i){cart.splice(i,1);saveCart();renderCart()}
-async function checkout(){const n=document.getElementById('co-name').value.trim(),e=document.getElementById('co-email').value.trim(),ph=document.getElementById('co-phone').value.trim();if(!n||!e||!ph){showToast('Please fill in all fields');return}sessionStorage.setItem('co_name',n);sessionStorage.setItem('co_email',e);sessionStorage.setItem('co_phone',ph);const btn=document.getElementById('checkout-btn');btn.disabled=true;btn.textContent='Processing...';try{const r=await fetch('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:cart,customer:{name:n,email:e,phone:ph}})});const d=await r.json();if(d.url)window.location.href=d.url;else{showToast(d.error||'Checkout failed');btn.disabled=false;btn.textContent='Checkout'}}catch(err){showToast('Connection error');btn.disabled=false;btn.textContent='Checkout'}}
+
+function renderCart(){
+  const ie=document.getElementById('cart-items'),fe=document.getElementById('cart-footer');
+  if(!cart.length){ie.innerHTML='<div class="cs-empty">Your cart is empty</div>';fe.innerHTML='';return}
+  ie.innerHTML=cart.map((c,i)=>{
+    return '<div class="ci"><div class="ci-info"><h4>'+esc(c.name)+'</h4>'+(c.variantName?'<div class="opts">'+esc(c.variantName)+'</div>':'')+'<div class="ip">$'+(c.teamPrice*c.qty).toFixed(2)+'</div></div><div style="text-align:right"><div class="ci-qty"><button onclick="updateCartQty('+i+',-1)">-</button><span>'+c.qty+'</span><button onclick="updateCartQty('+i+',1)">+</button></div><button class="ci-remove" onclick="removeCartItem('+i+')">Remove</button></div></div>';
+  }).join('');
+  const total=cart.reduce((s,c)=>s+c.teamPrice*c.qty,0);
+  fe.innerHTML='<div class="cs-total"><span>Total</span><span>$'+total.toFixed(2)+'</span></div><div class="co-form"><input type="text" id="co-name" placeholder="Full Name" value="'+esc(sessionStorage.getItem('co_name')||'')+'"><input type="email" id="co-email" placeholder="Email" value="'+esc(sessionStorage.getItem('co_email')||'')+'"><input type="tel" id="co-phone" placeholder="Phone" value="'+esc(sessionStorage.getItem('co_phone')||'')+'"><p style="font-size:12px;color:#6b7280;margin:8px 0">Local pickup only</p><button class="btn btn-primary btn-full" onclick="checkout()" id="checkout-btn">Checkout &middot; $'+total.toFixed(2)+'</button></div>';
+}
+
+function updateCartQty(i,d){cart[i].qty=Math.max(1,cart[i].qty+d);saveCart();renderCart()}
+function removeCartItem(i){cart.splice(i,1);saveCart();renderCart()}
+
+async function checkout(){
+  const n=document.getElementById('co-name').value.trim(),e=document.getElementById('co-email').value.trim(),ph=document.getElementById('co-phone').value.trim();
+  if(!n||!e||!ph){showToast('Please fill in all fields');return}
+  sessionStorage.setItem('co_name',n);sessionStorage.setItem('co_email',e);sessionStorage.setItem('co_phone',ph);
+  const btn=document.getElementById('checkout-btn');btn.disabled=true;btn.textContent='Processing...';
+  try{
+    const r=await fetch('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:cart,customer:{name:n,email:e,phone:ph}})});
+    const d=await r.json();
+    if(d.url)window.location.href=d.url;
+    else{showToast(d.error||'Checkout failed');btn.disabled=false;btn.textContent='Checkout'}
+  }catch(err){showToast('Connection error');btn.disabled=false;btn.textContent='Checkout'}
+}
+
 function showToast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500)}
 function esc(s){if(!s)return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 </script></body></html>`;
 }
 
 function checkoutSuccessPage() {
-  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Order Confirmed</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Inter',system-ui,sans-serif;background:#f8f9fa;color:#1a1a2e}.rp{display:flex;align-items:center;justify-content:center;min-height:100vh}.rb{background:#fff;padding:48px;border-radius:12px;border:1px solid #e5e7eb;max-width:440px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08)}.rb h2{font-size:22px;font-weight:700;margin:16px 0 8px;color:#1a1a2e}.rb p{color:#6b7280;margin-bottom:24px;font-size:14px;line-height:1.6}.ri{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto;background:#f0fdf4;color:#16a34a}.btn{padding:10px 20px;border-radius:6px;border:none;font-size:14px;font-weight:500;cursor:pointer;background:#4f46e5;color:#fff;text-decoration:none;display:inline-block}</style></head><body><div class="rp"><div class="rb"><div class="ri">${ICONS.check}</div><h2>Order Confirmed</h2><p>Thanks for your order. We will have it ready for pickup at Ice Lab. You will receive a confirmation email shortly.</p><a href="/" class="btn">Continue Shopping</a></div></div><script>localStorage.removeItem('icelab_cart')</script></body></html>`;
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Order Confirmed</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Inter',system-ui,sans-serif;background:#f8f9fa;color:#1a1a2e}.rp{display:flex;align-items:center;justify-content:center;min-height:100vh}.rb{background:#fff;padding:48px;border-radius:12px;border:1px solid #e5e7eb;max-width:440px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,0.08)}.rb h2{font-size:22px;font-weight:700;margin:16px 0 8px;color:#1a1a2e}.rb p{color:#6b7280;margin-bottom:24px;font-size:14px;line-height:1.6}.ri{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto;background:#f0fdf4;color:#16a34a}.btn{padding:10px 20px;border-radius:6px;border:none;font-size:14px;font-weight:500;cursor:pointer;background:#4f46e5;color:#fff;text-decoration:none;display:inline-block}</style></head><body><div class="rp"><div class="rb"><div class="ri">${ICONS.check}</div><h2>Order Confirmed</h2><p>Thanks for your order! We will have it ready for pickup at Ice Lab. You will receive a confirmation email shortly.</p><a href="/" class="btn">Continue Shopping</a></div></div><script>localStorage.removeItem('icelab_cart')</script></body></html>`;
 }
 
 function checkoutCancelPage() {
@@ -419,34 +1002,25 @@ function adminPage() {
 .admin-main{flex:1;overflow-y:auto;background:#f8f9fa;display:flex;flex-direction:column}
 .admin-topbar{background:#fff;border-bottom:1px solid #e5e7eb;padding:0 32px;height:52px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}.admin-topbar h2{font-size:16px;font-weight:600}.admin-topbar-actions{display:flex;align-items:center;gap:8px}.admin-topbar a{color:#4f46e5;font-size:13px;font-weight:500;text-decoration:none;display:flex;align-items:center;gap:4px}
 .admin-content{padding:32px;flex:1;overflow-y:auto}
-.card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.08);margin-bottom:24px}.card-header{padding:16px 20px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between}.card-header h3{font-size:15px;font-weight:600}.card-body{padding:20px}.card-muted{color:#6b7280;font-size:13px;padding:16px 20px;border-bottom:1px solid #f0f0f0}
+.card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.08);margin-bottom:24px}.card-header{padding:16px 20px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between}.card-header h3{font-size:15px;font-weight:600}.card-body{padding:20px}
 table{width:100%;border-collapse:collapse}th{padding:10px 16px;text-align:left;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;background:#f8f9fa;border-bottom:1px solid #e5e7eb}td{padding:10px 16px;font-size:13px;border-bottom:1px solid #f0f0f0;vertical-align:middle}tr:hover td{background:#f9fafb}
 .prod-name{font-weight:600;font-size:13px;color:#1a1a2e}.prod-sku{font-size:11px;color:#6b7280;margin-top:1px}.prod-thumb{width:40px;height:40px;border-radius:4px;background:#f0f1f3;display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0}.prod-thumb img{width:100%;height:100%;object-fit:cover}.prod-thumb svg{width:16px;height:16px}.prod-cell{display:flex;align-items:center;gap:10px}
-.edit-btn{background:none;border:none;color:#9ca3af;cursor:pointer;padding:4px;border-radius:4px;transition:all 0.15s}.edit-btn:hover{color:#4f46e5;background:#f5f3ff}.cb{width:16px;height:16px;accent-color:#4f46e5;cursor:pointer}
-.badge-status{padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600;display:inline-block}.badge-pending{background:#fffbeb;color:#d97706}.badge-ready{background:#eff6ff;color:#2563eb}.badge-picked_up{background:#f0fdf4;color:#16a34a}.badge-cancelled{background:#fef2f2;color:#dc2626}
-.filter-tabs{display:flex;gap:0;border-bottom:1px solid #e5e7eb;padding:0 20px;background:#fff;border-radius:8px 8px 0 0}.filter-tab{padding:12px 16px;font-size:13px;font-weight:500;color:#6b7280;border:none;background:none;cursor:pointer;border-bottom:2px solid transparent;transition:all 0.15s;font-family:inherit;display:flex;align-items:center;gap:6px}.filter-tab:hover{color:#1a1a2e}.filter-tab.active{color:#4f46e5;border-bottom-color:#4f46e5}.filter-count{background:#f0f0f0;color:#6b7280;font-size:10px;font-weight:600;padding:1px 6px;border-radius:8px}.filter-tab.active .filter-count{background:#ede9fe;color:#4f46e5}
-.search-bar{background:#f8f9fa;border:1px solid #e5e7eb;border-radius:8px;padding:16px;margin-bottom:16px;display:flex;gap:12px;align-items:center}.search-input{flex:1;position:relative}.search-input input{width:100%;padding:8px 12px 8px 32px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;color:#1a1a2e;background:#fff;font-family:inherit;transition:border 0.15s}.search-input input:focus{border-color:#4f46e5;outline:none;box-shadow:0 0 0 3px rgba(79,70,229,0.1)}.search-input input::placeholder{color:#9ca3af}.search-input .search-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:#9ca3af;display:flex}.filter-select{padding:8px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;color:#1a1a2e;background:#fff;font-family:inherit;cursor:pointer}.filter-select:focus{border-color:#4f46e5;outline:none}
-.btn{padding:8px 16px;border-radius:6px;border:none;font-size:13px;font-weight:500;cursor:pointer;transition:all 0.15s;display:inline-flex;align-items:center;justify-content:center;gap:6px;font-family:inherit}.btn-primary{background:#4f46e5;color:#fff}.btn-primary:hover{background:#4338ca}.btn-outline{background:#fff;border:1px solid #d1d5db;color:#374151}.btn-outline:hover{background:#f9fafb}.btn-danger{background:#dc2626;color:#fff}.btn-danger:hover{background:#b91c1c}.btn-sm{padding:6px 12px;font-size:12px}.btn-success{background:#16a34a;color:#fff}.btn-success:hover{background:#15803d}.btn-blue{background:#2563eb;color:#fff}.btn-blue:hover{background:#1d4ed8}.btn-ghost{background:none;border:none;color:#4f46e5;font-weight:500;cursor:pointer;font-size:13px;font-family:inherit;padding:0}.btn-ghost:hover{text-decoration:underline}
-.fg{margin-bottom:14px}.fg label{display:block;font-size:12px;color:#374151;margin-bottom:4px;font-weight:600}.fg input,.fg textarea,.fg select{width:100%;padding:8px 12px;background:#fff;border:1px solid #d1d5db;border-radius:6px;color:#1a1a2e;font-size:13px;font-family:inherit;transition:border 0.15s}.fg input:focus,.fg textarea:focus,.fg select:focus{border-color:#4f46e5;outline:none;box-shadow:0 0 0 3px rgba(79,70,229,0.1)}.fg textarea{min-height:72px;resize:vertical}.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.fg-row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
-.section-title{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:#6b7280;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid #e5e7eb}
-.vt-row{display:flex;gap:8px;align-items:flex-start;margin-bottom:8px;padding:12px;background:#f8f9fa;border-radius:6px;border:1px solid #e5e7eb}.vt-row select,.vt-row input{padding:7px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;color:#1a1a2e;background:#fff;font-family:inherit}.vt-row select:focus,.vt-row input:focus{border-color:#4f46e5;outline:none}
-.tag-wrap{display:flex;flex-wrap:wrap;gap:4px;padding:4px 8px;background:#fff;border:1px solid #d1d5db;border-radius:6px;min-height:34px;align-items:center;cursor:text;transition:border 0.15s}.tag-wrap:focus-within{border-color:#4f46e5;box-shadow:0 0 0 3px rgba(79,70,229,0.1)}.tag{background:#ede9fe;color:#4f46e5;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:500;display:flex;align-items:center;gap:4px}.tag .rm{cursor:pointer;color:#a78bfa;font-size:14px;line-height:1}.tag .rm:hover{color:#dc2626}.tag-wrap input{border:none;background:none;color:#1a1a2e;font-size:12px;outline:none;flex:1;min-width:60px;padding:2px;font-family:inherit}
-.vt-remove{background:none;border:none;color:#d1d5db;cursor:pointer;padding:4px;transition:color 0.15s;flex-shrink:0;margin-top:2px}.vt-remove:hover{color:#dc2626}
-.vs-table{width:100%;border-collapse:collapse;font-size:13px}.vs-table th{padding:8px 6px;text-align:left;font-size:10px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;background:#f8f9fa;border-bottom:1px solid #e5e7eb}.vs-table td{padding:6px;border-bottom:1px solid #f0f0f0}.vs-table input{padding:5px 8px;border:1px solid #d1d5db;border-radius:4px;font-size:12px;color:#1a1a2e;background:#fff;font-family:inherit;transition:border 0.15s}.vs-table input:focus{border-color:#4f46e5;outline:none}
-.vs-remove{background:none;border:none;color:#d1d5db;cursor:pointer;padding:2px;transition:color 0.15s}.vs-remove:hover{color:#dc2626}
-.apply-link{font-size:10px;color:#4f46e5;cursor:pointer;font-weight:500;display:block}.apply-link:hover{text-decoration:underline}
+.btn{padding:8px 16px;border-radius:6px;border:none;font-size:13px;font-weight:500;cursor:pointer;transition:all 0.15s;display:inline-flex;align-items:center;justify-content:center;gap:6px;font-family:inherit}.btn-primary{background:#4f46e5;color:#fff}.btn-primary:hover{background:#4338ca}.btn-outline{background:#fff;border:1px solid #d1d5db;color:#374151}.btn-outline:hover{background:#f9fafb}.btn-sm{padding:6px 12px;font-size:12px}.btn-success{background:#16a34a;color:#fff}.btn-success:hover{background:#15803d}.btn-ghost{background:none;border:none;color:#4f46e5;font-weight:500;cursor:pointer;font-size:13px;font-family:inherit;padding:0}.btn-ghost:hover{text-decoration:underline}
 .toggle{position:relative;width:36px;height:20px;display:inline-block}.toggle input{opacity:0;width:0;height:0}.toggle-slider{position:absolute;cursor:pointer;inset:0;background:#d1d5db;border-radius:20px;transition:0.15s}.toggle-slider:before{content:'';position:absolute;height:16px;width:16px;left:2px;bottom:2px;background:#fff;border-radius:50%;transition:0.15s}.toggle input:checked+.toggle-slider{background:#4f46e5}.toggle input:checked+.toggle-slider:before{transform:translateX(16px)}
-.upload-zone{border:2px dashed #d1d5db;border-radius:8px;padding:24px;text-align:center;color:#6b7280;font-size:13px;margin-bottom:12px;transition:border-color 0.15s}.upload-zone:hover{border-color:#4f46e5}.upload-zone p{margin-bottom:8px}
-.img-preview{width:80px;height:80px;border-radius:6px;border:1px solid #e5e7eb;overflow:hidden;margin-bottom:8px;display:none}.img-preview img{width:100%;height:100%;object-fit:cover}
-.combobox{position:relative}.combobox input{width:100%;padding:7px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;color:#1a1a2e;background:#fff;font-family:inherit}.combobox input:focus{border-color:#4f46e5;outline:none}.combobox-list{position:absolute;top:100%;left:0;right:0;background:#fff;border:1px solid #e5e7eb;border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.1);z-index:10;max-height:200px;overflow-y:auto;display:none}.combobox-list.show{display:block}.combobox-list div{padding:8px 12px;font-size:13px;cursor:pointer;transition:background 0.1s}.combobox-list div:hover{background:#f5f3ff;color:#4f46e5}
-.od-info{display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px;padding:20px 24px;border-bottom:1px solid #e5e7eb}.od-info-item label{font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:#6b7280;font-weight:600;display:block;margin-bottom:2px}.od-info-item span{font-size:14px;color:#1a1a2e;font-weight:500}.od-total{padding:16px 24px;border-top:1px solid #e5e7eb;display:flex;justify-content:flex-end;gap:24px;font-weight:600}.od-actions{padding:16px 24px;border-top:1px solid #e5e7eb;display:flex;gap:8px;flex-wrap:wrap}
-.back-link{display:inline-flex;align-items:center;gap:4px;color:#6b7280;font-size:13px;cursor:pointer;font-weight:500;margin-bottom:16px;transition:color 0.15s}.back-link:hover{color:#1a1a2e}
+.fg{margin-bottom:14px}.fg label{display:block;font-size:12px;color:#374151;margin-bottom:4px;font-weight:600}.fg input,.fg textarea,.fg select{width:100%;padding:8px 12px;background:#fff;border:1px solid #d1d5db;border-radius:6px;color:#1a1a2e;font-size:13px;font-family:inherit;transition:border 0.15s}.fg input:focus,.fg textarea:focus,.fg select:focus{border-color:#4f46e5;outline:none;box-shadow:0 0 0 3px rgba(79,70,229,0.1)}.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .settings-card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.08);padding:24px;margin-bottom:20px}.settings-card h3{font-size:14px;font-weight:600;margin-bottom:16px;color:#1a1a2e}
 .empty-state{text-align:center;color:#6b7280;padding:40px;font-size:14px}
+.badge-status{padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600;display:inline-block}.badge-success{background:#f0fdf4;color:#16a34a}.badge-warning{background:#fffbeb;color:#d97706}.badge-error{background:#fef2f2;color:#dc2626}.badge-info{background:#eff6ff;color:#2563eb}
+.search-bar{background:#f8f9fa;border:1px solid #e5e7eb;border-radius:8px;padding:16px;margin-bottom:16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}.search-input{flex:1;position:relative;min-width:200px}.search-input input{width:100%;padding:8px 12px 8px 32px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;color:#1a1a2e;background:#fff;font-family:inherit;transition:border 0.15s}.search-input input:focus{border-color:#4f46e5;outline:none;box-shadow:0 0 0 3px rgba(79,70,229,0.1)}.search-input input::placeholder{color:#9ca3af}.search-input .search-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:#9ca3af;display:flex}
+.filter-select{padding:8px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;color:#1a1a2e;background:#fff;font-family:inherit;cursor:pointer}
+.sync-info{display:flex;align-items:center;gap:8px;font-size:12px;color:#6b7280;padding:12px 20px;border-bottom:1px solid #f0f0f0;background:#f8f9fa}
+.price-input{width:80px;padding:5px 8px;border:1px solid #d1d5db;border-radius:4px;font-size:12px;color:#1a1a2e;background:#fff;text-align:right}
+.price-input:focus{border-color:#4f46e5;outline:none}
 .toast{position:fixed;bottom:24px;right:24px;background:#1a1a2e;color:#fff;padding:10px 18px;border-radius:6px;font-size:13px;font-weight:500;z-index:600;transform:translateY(60px);opacity:0;transition:all 0.25s}.toast.show{transform:translateY(0);opacity:1}
-.pricing-row{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;align-items:end}.pricing-row .fg{margin-bottom:0}
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.3);backdrop-filter:blur(2px);z-index:500;display:flex;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto}.modal{background:#fff;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,0.15);max-width:500px;width:100%}.modal-header{padding:20px 24px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between}.modal-header h2{font-size:18px;font-weight:600}.modal-close{background:none;border:none;color:#6b7280;cursor:pointer;padding:4px}.modal-close:hover{color:#1a1a2e}.modal-body{padding:24px}.modal-footer{padding:16px 24px;border-top:1px solid #e5e7eb;display:flex;justify-content:flex-end;gap:8px}
-@media(max-width:768px){.sidebar{display:none;position:fixed;top:0;left:0;bottom:0;z-index:301;box-shadow:4px 0 12px rgba(0,0,0,0.1)}.sidebar.open{display:flex}.sidebar-overlay.open{display:block}.mobile-header{display:flex}.admin-content{padding:16px}.admin-topbar{padding:0 16px}.od-info{grid-template-columns:1fr}.fg-row{grid-template-columns:1fr}.fg-row3{grid-template-columns:1fr}.pricing-row{grid-template-columns:1fr 1fr}}
+.stat-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:16px;margin-bottom:24px}.stat-card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:16px}.stat-card .label{font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:#6b7280;font-weight:600;margin-bottom:4px}.stat-card .value{font-size:22px;font-weight:700;color:#1a1a2e}
+.od-info{display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px;padding:20px 24px;border-bottom:1px solid #e5e7eb}.od-info-item label{font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:#6b7280;font-weight:600;display:block;margin-bottom:2px}.od-info-item span{font-size:14px;color:#1a1a2e;font-weight:500}
+.back-link{display:inline-flex;align-items:center;gap:4px;color:#6b7280;font-size:13px;cursor:pointer;font-weight:500;margin-bottom:16px;transition:color 0.15s}.back-link:hover{color:#1a1a2e}
+@media(max-width:768px){.sidebar{display:none;position:fixed;top:0;left:0;bottom:0;z-index:301;box-shadow:4px 0 12px rgba(0,0,0,0.1)}.sidebar.open{display:flex}.sidebar-overlay.open{display:block}.mobile-header{display:flex}.admin-content{padding:16px}.admin-topbar{padding:0 16px}.od-info{grid-template-columns:1fr}.fg-row{grid-template-columns:1fr}.stat-cards{grid-template-columns:1fr 1fr}}
 </style></head><body>
 <div id="admin-pin-screen"><div class="pin-box"><h1>Admin Access</h1><p>Enter admin PIN</p><div class="pin-dots"><input type="tel" maxlength="1" autofocus><input type="tel" maxlength="1"><input type="tel" maxlength="1"><input type="tel" maxlength="1"></div><div class="pin-error" id="pin-error"></div></div></div>
 <div id="admin-app" style="display:none">
@@ -454,131 +1028,330 @@ table{width:100%;border-collapse:collapse}th{padding:10px 16px;text-align:left;f
 <div class="sidebar-overlay" id="sidebar-overlay" onclick="toggleSidebar()"></div>
 <div class="admin-layout">
 <aside class="sidebar" id="sidebar"><div class="sidebar-brand">Ice Lab Team Store <span class="badge">Admin</span></div><nav class="sidebar-nav">
-<button class="active" onclick="showTab('orders')" data-tab="orders">${ICONS.orders} Orders</button>
+<button class="active" onclick="showTab('import')" data-tab="import">${ICONS.importIcon} Import Products</button>
 <button onclick="showTab('products')" data-tab="products">${ICONS.products} Products</button>
-<button onclick="showTab('categories')" data-tab="categories">${ICONS.categories} Categories</button>
+<button onclick="showTab('orders')" data-tab="orders">${ICONS.orders} Recent Orders</button>
 <button onclick="showTab('settings')" data-tab="settings">${ICONS.settings} Settings</button>
 </nav><div class="sidebar-footer"><a href="/">${ICONS.store} View Store</a></div></aside>
 <div class="admin-main">
-<div class="admin-topbar" id="admin-topbar"><h2 id="topbar-title">Orders</h2><div class="admin-topbar-actions" id="topbar-actions"><a href="/">${ICONS.store} View Store</a></div></div>
+<div class="admin-topbar" id="admin-topbar"><h2 id="topbar-title">Import Products</h2><div class="admin-topbar-actions" id="topbar-actions"><a href="/">${ICONS.store} View Store</a></div></div>
 <div class="admin-content" id="admin-content"></div>
 </div></div></div>
 <div class="toast" id="toast"></div>
 <script>
-let adminCategories=[],adminProducts=[],adminOrders=[],customAttributes=[],currentTab='orders',orderFilter='all',searchQuery='',catFilter='';
+let importProducts=[],enabledProducts=[],adminOrders=[],currentTab='import',searchQuery='',brandFilter='',showEnabledOnly=false;
+let syncTimestamp=null,discountPercent=15;
 const IC=${JSON.stringify(ICONS)};
-const PRESETS=['Size','Color','Hand','Flex','Curve'];
 
+// PIN
 const pinInputs=document.querySelectorAll('.pin-dots input');
 pinInputs.forEach((inp,i)=>{inp.addEventListener('input',()=>{if(inp.value&&i<pinInputs.length-1)pinInputs[i+1].focus();if(i===pinInputs.length-1&&inp.value)checkAdminPin()});inp.addEventListener('keydown',e=>{if(e.key==='Backspace'&&!inp.value&&i>0)pinInputs[i-1].focus()})});
 async function checkAdminPin(){const pin=Array.from(pinInputs).map(i=>i.value).join('');if(pin.length<4)return;try{const r=await fetch('/api/verify-admin-pin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin})});if(r.ok){sessionStorage.setItem('admin_pin',pin);document.getElementById('admin-pin-screen').style.display='none';document.getElementById('admin-app').style.display='';loadAdmin()}else{document.getElementById('pin-error').textContent='Invalid PIN';pinInputs.forEach(i=>i.value='');pinInputs[0].focus()}}catch(e){document.getElementById('pin-error').textContent='Connection error'}}
 if(sessionStorage.getItem('admin_pin')){document.getElementById('admin-pin-screen').style.display='none';document.getElementById('admin-app').style.display='';loadAdmin()}
 
 function toggleSidebar(){document.getElementById('sidebar').classList.toggle('open');document.getElementById('sidebar-overlay').classList.toggle('open')}
-async function loadAdmin(){const[cr,pr,or,ar]=await Promise.all([fetch('/api/admin/categories'),fetch('/api/admin/products'),fetch('/api/admin/orders'),fetch('/api/admin/custom-attributes')]);adminCategories=await cr.json();adminProducts=await pr.json();adminOrders=await or.json();customAttributes=await ar.json();showTab(currentTab)}
-function showTab(tab){currentTab=tab;document.querySelectorAll('.sidebar-nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));document.getElementById('sidebar').classList.remove('open');document.getElementById('sidebar-overlay').classList.remove('open');
-if(tab==='orders')renderOrders();else if(tab==='products')renderProducts();else if(tab==='categories')renderCategories();else if(tab==='settings')renderSettings();else if(tab==='product-edit')return;}
+
+async function loadAdmin(){showTab(currentTab)}
+
+function showTab(tab){
+  currentTab=tab;
+  document.querySelectorAll('.sidebar-nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebar-overlay').classList.remove('open');
+  if(tab==='import')renderImport();
+  else if(tab==='products')renderProducts();
+  else if(tab==='orders')renderOrders();
+  else if(tab==='settings')renderSettings();
+}
+
 function setTopbar(title,actions){document.getElementById('topbar-title').textContent=title;document.getElementById('topbar-actions').innerHTML=actions||'<a href="/">${ICONS.store} View Store</a>'}
 
+// ============ IMPORT PRODUCTS ============
+async function renderImport(){
+  setTopbar('Import Products','<a href="/">${ICONS.store} View Store</a>');
+  const c=document.getElementById('admin-content');
+  c.innerHTML='<div class="empty-state">Loading products from Lightspeed...</div>';
+
+  try{
+    const r=await fetch('/api/admin/import-products');
+    const data=await r.json();
+    importProducts=data.products||[];
+    syncTimestamp=data.syncTimestamp;
+    discountPercent=data.discountPercent||15;
+    renderImportTable();
+  }catch(e){
+    c.innerHTML='<div class="settings-card"><h3>Lightspeed Connection</h3><p style="color:#6b7280;margin-bottom:16px">No products synced yet. Click the button below to sync products from Lightspeed.</p><button class="btn btn-primary" onclick="syncProducts()">Sync Products from Lightspeed</button></div>';
+  }
+}
+
+function renderImportTable(){
+  const c=document.getElementById('admin-content');
+
+  // Group variants by parent
+  const parentMap={};
+  const standalone=[];
+  for(const p of importProducts){
+    if(p.variantParentId){
+      if(!parentMap[p.variantParentId])parentMap[p.variantParentId]={parent:null,children:[]};
+      parentMap[p.variantParentId].children.push(p);
+    }else if(p.hasVariants){
+      if(!parentMap[p.id])parentMap[p.id]={parent:p,children:[]};
+      else parentMap[p.id].parent=p;
+    }else{
+      standalone.push(p);
+    }
+  }
+
+  // Build display list (parents + standalone)
+  let displayList=[];
+  for(const[id,group] of Object.entries(parentMap)){
+    const parent=group.parent||group.children[0];
+    const totalStock=group.children.reduce((s,c)=>s+(c.stock||0),0)+(parent?.stock||0);
+    const anyEnabled=group.children.some(c=>c.enabled)||(parent?.enabled||false);
+    displayList.push({
+      ...parent,
+      id:id,
+      stock:totalStock,
+      variantCount:group.children.length,
+      enabled:anyEnabled,
+      children:group.children,
+      isGroup:true
+    });
+  }
+  for(const p of standalone){
+    displayList.push({...p,isGroup:false,children:[]});
+  }
+
+  // Get brands for filter
+  const brands=[...new Set(displayList.map(p=>p.brand).filter(Boolean))].sort();
+
+  // Filter
+  let filtered=displayList;
+  if(searchQuery){const q=searchQuery.toLowerCase();filtered=filtered.filter(p=>p.name?.toLowerCase().includes(q)||p.sku?.toLowerCase().includes(q)||p.brand?.toLowerCase().includes(q))}
+  if(brandFilter)filtered=filtered.filter(p=>p.brand===brandFilter);
+  if(showEnabledOnly)filtered=filtered.filter(p=>p.enabled);
+
+  const enabledCount=displayList.filter(p=>p.enabled).length;
+
+  c.innerHTML=
+    '<div class="stat-cards">'+
+      '<div class="stat-card"><div class="label">Total Products</div><div class="value">'+displayList.length+'</div></div>'+
+      '<div class="stat-card"><div class="label">Enabled in Store</div><div class="value">'+enabledCount+'</div></div>'+
+      '<div class="stat-card"><div class="label">Discount</div><div class="value">'+discountPercent+'%</div></div>'+
+      '<div class="stat-card"><div class="label">Last Sync</div><div class="value" style="font-size:13px">'+(syncTimestamp?new Date(syncTimestamp).toLocaleString():'Never')+'</div></div>'+
+    '</div>'+
+    '<div class="card">'+
+      '<div class="card-header"><h3>Lightspeed Products</h3><button class="btn btn-primary btn-sm" onclick="syncProducts()" id="sync-btn">${ICONS.sync} Sync from Lightspeed</button></div>'+
+      '<div class="search-bar">'+
+        '<div class="search-input"><span class="search-icon">${ICONS.search}</span><input id="import-search" placeholder="Search by name, SKU, brand..." value="'+esc(searchQuery)+'" oninput="searchQuery=this.value;renderImportTable()"></div>'+
+        '<select class="filter-select" onchange="brandFilter=this.value;renderImportTable()"><option value="">All Brands</option>'+brands.map(b=>'<option value="'+esc(b)+'"'+(brandFilter===b?' selected':'')+'>'+esc(b)+'</option>').join('')+'</select>'+
+        '<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#6b7280;cursor:pointer;white-space:nowrap"><input type="checkbox" '+(showEnabledOnly?'checked':'')+' onchange="showEnabledOnly=this.checked;renderImportTable()" style="accent-color:#4f46e5"> Enabled only</label>'+
+      '</div>'+
+      (filtered.length===0?'<div class="empty-state">'+(importProducts.length===0?'No products synced. Click "Sync from Lightspeed" to load products.':'No products match your search.')+'</div>':
+      '<table><thead><tr><th style="width:50px">Show</th><th>Product</th><th>Brand</th><th>Variants</th><th>Stock</th><th>Retail Price</th><th>Team Price</th></tr></thead><tbody>'+
+      filtered.map(p=>{
+        const thumb=p.imageUrl?'<img src="'+esc(p.imageUrl)+'" style="width:32px;height:32px;border-radius:4px;object-fit:cover">':'<div style="width:32px;height:32px;background:#f0f1f3;border-radius:4px;display:flex;align-items:center;justify-content:center"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#c0c4cc" stroke-width="1.5"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3Z"/><circle cx="12" cy="13" r="3"/></svg></div>';
+        const teamPrice=p.teamPrice||Math.round(p.retailPrice*(1-discountPercent/100)*100)/100;
+        return '<tr>'+
+          '<td><label class="toggle"><input type="checkbox" '+(p.enabled?'checked':'')+' onchange="toggleProduct(\\''+p.id+'\\',this.checked)"><span class="toggle-slider"></span></label></td>'+
+          '<td><div class="prod-cell">'+thumb+'<div><div class="prod-name">'+esc(p.name)+'</div><div class="prod-sku">'+esc(p.sku||'')+'</div></div></div></td>'+
+          '<td style="color:#6b7280">'+esc(p.brand||'-')+'</td>'+
+          '<td>'+(p.variantCount||0)+'</td>'+
+          '<td>'+(p.stock||0)+'</td>'+
+          '<td>$'+(p.retailPrice||0).toFixed(2)+'</td>'+
+          '<td><input type="number" step="0.01" class="price-input" value="'+teamPrice.toFixed(2)+'" onchange="updateTeamPrice(\\''+p.id+'\\',this.value)" '+(p.enabled?'':'disabled')+' id="price-'+p.id+'"></td>'+
+        '</tr>';
+      }).join('')+'</tbody></table>')+
+    '</div>';
+}
+
+async function syncProducts(){
+  const btn=document.getElementById('sync-btn');
+  if(btn){btn.disabled=true;btn.innerHTML='Syncing...';}
+  try{
+    const r=await fetch('/api/admin/lightspeed/sync');
+    const data=await r.json();
+    if(data.success){
+      showToast('Synced '+data.totalProducts+' products from Lightspeed');
+      renderImport();
+    }else{
+      showToast('Sync failed: '+(data.error||'Unknown error'));
+    }
+  }catch(e){showToast('Sync failed: '+e.message)}
+  finally{if(btn){btn.disabled=false;btn.innerHTML=IC.sync+' Sync from Lightspeed'}}
+}
+
+async function toggleProduct(productId,enabled){
+  try{
+    // If this is a group (parent with variants), toggle all children too
+    const parent=importProducts.find(p=>p.id===productId);
+    const children=importProducts.filter(p=>p.variantParentId===productId);
+
+    // Toggle parent
+    await fetch('/api/admin/lightspeed/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({productId,enabled})});
+
+    // Toggle all children
+    for(const child of children){
+      await fetch('/api/admin/lightspeed/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({productId:child.id,enabled})});
+    }
+
+    // Update local state
+    const updateLocal=(id)=>{const p=importProducts.find(x=>x.id===id);if(p)p.enabled=enabled};
+    updateLocal(productId);
+    children.forEach(c=>updateLocal(c.id));
+
+    // Enable/disable price input
+    const priceInput=document.getElementById('price-'+productId);
+    if(priceInput)priceInput.disabled=!enabled;
+
+    showToast(enabled?'Product enabled in team store':'Product removed from team store');
+  }catch(e){showToast('Error: '+e.message)}
+}
+
+async function updateTeamPrice(productId,value){
+  const price=parseFloat(value);
+  if(isNaN(price)||price<0){showToast('Invalid price');return}
+  try{
+    // Update parent
+    await fetch('/api/admin/lightspeed/price',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({productId,teamPrice:price})});
+
+    // Also update children
+    const children=importProducts.filter(p=>p.variantParentId===productId);
+    for(const child of children){
+      if(child.enabled){
+        await fetch('/api/admin/lightspeed/price',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({productId:child.id,teamPrice:price})});
+      }
+    }
+
+    showToast('Team price updated');
+  }catch(e){showToast('Error: '+e.message)}
+}
+
+// ============ PRODUCTS (enabled list) ============
+async function renderProducts(){
+  setTopbar('Enabled Products');
+  const c=document.getElementById('admin-content');
+  c.innerHTML='<div class="empty-state">Loading...</div>';
+  try{
+    const r=await fetch('/api/admin/enabled-products');
+    enabledProducts=await r.json();
+    c.innerHTML='<div class="card"><div class="card-header"><h3>Team Store Products</h3><span style="font-size:12px;color:#6b7280">'+enabledProducts.length+' product(s) enabled</span></div>'+
+      (enabledProducts.length===0?'<div class="empty-state">No products enabled yet. Go to Import Products to add products from Lightspeed.</div>':
+      '<table><thead><tr><th>Product</th><th>Brand</th><th>SKU</th><th>Retail</th><th>Team Price</th><th>Stock</th></tr></thead><tbody>'+
+      enabledProducts.map(p=>{
+        const thumb=p.imageUrl?'<img src="'+esc(p.imageUrl)+'" style="width:32px;height:32px;border-radius:4px;object-fit:cover">':'';
+        return '<tr><td><div class="prod-cell">'+(thumb||'')+'<div class="prod-name">'+esc(p.name)+'</div></div></td><td style="color:#6b7280">'+esc(p.brand||'-')+'</td><td style="color:#6b7280;font-size:11px">'+esc(p.sku||'-')+'</td><td>$'+(p.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600;color:#16a34a">$'+(p.teamPrice||0).toFixed(2)+'</td><td>'+(p.stock||0)+'</td></tr>';
+      }).join('')+'</tbody></table>')+
+    '</div>';
+  }catch(e){c.innerHTML='<div class="empty-state">Error loading products</div>'}
+}
+
 // ============ ORDERS ============
-function renderOrders(detail){setTopbar('Orders');if(detail)return renderOrderDetail(detail);const counts={all:adminOrders.length,pending:adminOrders.filter(o=>o.status==='pending').length,ready:adminOrders.filter(o=>o.status==='ready').length,picked_up:adminOrders.filter(o=>o.status==='picked_up').length,cancelled:adminOrders.filter(o=>o.status==='cancelled').length};const filtered=orderFilter==='all'?adminOrders:adminOrders.filter(o=>o.status===orderFilter);const sorted=[...filtered].sort((a,b)=>{if(a.status==='pending'&&b.status!=='pending')return -1;if(b.status==='pending'&&a.status!=='pending')return 1;return new Date(b.createdAt)-new Date(a.createdAt)});
-const c=document.getElementById('admin-content');c.innerHTML='<div class="card"><div class="filter-tabs">'+['all','pending','ready','picked_up','cancelled'].map(f=>'<button class="filter-tab'+(orderFilter===f?' active':'')+'" onclick="orderFilter=\\''+f+'\\';renderOrders()">'+f.replace('_',' ').replace(/^./,c=>c.toUpperCase())+'<span class="filter-count">'+counts[f]+'</span></button>').join('')+'</div>'+(sorted.length===0?'<div class="empty-state">No orders</div>':'<table><thead><tr><th>Order</th><th>Customer</th><th>Email</th><th>Phone</th><th>Date</th><th>Items</th><th>Total</th><th>Status</th></tr></thead><tbody>'+sorted.map(o=>{const ic=o.items?.reduce((s,i)=>s+(i.qty||1),0)||0;const d=new Date(o.createdAt).toLocaleDateString('en-US',{month:'short',day:'numeric'});return '<tr onclick="renderOrders(\\''+o.id+'\\')" style="cursor:pointer"><td style="font-weight:600;color:#4f46e5">#'+o.id.slice(-6).toUpperCase()+'</td><td>'+esc(o.customer?.name)+'</td><td style="color:#6b7280;font-size:12px">'+esc(o.customer?.email)+'</td><td style="color:#6b7280;font-size:12px">'+esc(o.customer?.phone)+'</td><td style="color:#6b7280">'+d+'</td><td>'+ic+'</td><td style="font-weight:600">$'+(o.total||0).toFixed(2)+'</td><td><span class="badge-status badge-'+o.status+'">'+o.status.replace('_',' ')+'</span></td></tr>'}).join('')+'</tbody></table>')+'</div>'}
-function renderOrderDetail(orderId){const o=adminOrders.find(x=>x.id===orderId);if(!o)return;setTopbar('Order #'+o.id.slice(-6).toUpperCase());const c=document.getElementById('admin-content');const d=new Date(o.createdAt).toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'});c.innerHTML='<a class="back-link" onclick="renderOrders()">${ICONS.back} Back to Orders</a><div class="card"><div style="padding:20px 24px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between"><span style="font-size:18px;font-weight:700">#'+o.id.slice(-6).toUpperCase()+'</span><span class="badge-status badge-'+o.status+'" style="font-size:13px;padding:5px 14px">'+o.status.replace('_',' ')+'</span></div><div class="od-info"><div class="od-info-item"><label>Customer</label><span>'+esc(o.customer?.name)+'</span></div><div class="od-info-item"><label>Email</label><span>'+esc(o.customer?.email)+'</span></div><div class="od-info-item"><label>Phone</label><span>'+esc(o.customer?.phone)+'</span></div></div><div class="od-info" style="border-bottom:none"><div class="od-info-item"><label>Order Date</label><span>'+d+'</span></div><div class="od-info-item"><label>Order ID</label><span style="font-size:12px;color:#6b7280">'+o.id+'</span></div><div class="od-info-item"><label>Stripe</label><span style="font-size:12px;color:#6b7280">'+(o.stripePaymentIntent||'-')+'</span></div></div><div style="padding:0 24px"><table><thead><tr><th>Product</th><th>Variant</th><th>Qty</th><th>Unit Price</th><th>Total</th></tr></thead><tbody>'+(o.items||[]).map(item=>{const opts=Object.values(item.options||{}).join(', ');return '<tr><td style="font-weight:500">'+esc(item.name)+'</td><td style="color:#6b7280;font-size:12px">'+esc(opts||'-')+'</td><td>'+item.qty+'</td><td>$'+((item.price||0)).toFixed(2)+'</td><td style="font-weight:600">$'+((item.price||0)*item.qty).toFixed(2)+'</td></tr>'}).join('')+'</tbody></table></div><div class="od-total"><span>Total</span><span style="font-size:18px">$'+(o.total||0).toFixed(2)+'</span></div><div class="od-actions">'+orderActionButtons(o)+'</div></div>'}
-function orderActionButtons(o){if(o.status==='pending')return '<button class="btn btn-blue" onclick="updateOrderStatus(\\''+o.id+'\\',\\'ready\\')">Mark Ready for Pickup</button><button class="btn btn-outline" onclick="if(confirm(\\'Cancel this order?\\'))updateOrderStatus(\\''+o.id+'\\',\\'cancelled\\')">Cancel Order</button>';if(o.status==='ready')return '<button class="btn btn-success" onclick="updateOrderStatus(\\''+o.id+'\\',\\'picked_up\\')">Mark Picked Up</button><button class="btn btn-outline" onclick="if(confirm(\\'Cancel this order?\\'))updateOrderStatus(\\''+o.id+'\\',\\'cancelled\\')">Cancel Order</button>';return ''}
-async function updateOrderStatus(id,status){await fetch('/api/admin/order/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({orderId:id,status})});await loadAdmin();renderOrders(id);showToast('Order updated')}
+async function renderOrders(detailId){
+  setTopbar('Recent Orders');
+  const c=document.getElementById('admin-content');
+  c.innerHTML='<div class="empty-state">Loading...</div>';
+  try{
+    const r=await fetch('/api/admin/orders');
+    adminOrders=await r.json();
+  }catch(e){adminOrders=[]}
 
-// ============ PRODUCTS ============
-function renderProducts(){setTopbar('Products');const c=document.getElementById('admin-content');const active=adminProducts.filter(p=>p.active);let filtered=active;if(searchQuery){const q=searchQuery.toLowerCase();filtered=filtered.filter(p=>p.name.toLowerCase().includes(q)||(p.variants||[]).some(v=>(v.sku||'').toLowerCase().includes(q)))}if(catFilter)filtered=filtered.filter(p=>p.category===catFilter);
-c.innerHTML='<div class="search-bar"><div class="search-input"><span class="search-icon">${ICONS.search}</span><input id="prod-search" placeholder="Search by name, SKU..." value="'+esc(searchQuery)+'" oninput="searchQuery=this.value;renderProducts()"></div><select class="filter-select" onchange="catFilter=this.value;renderProducts()"><option value="">All Categories</option>'+adminCategories.map(cat=>'<option value="'+cat.id+'"'+(catFilter===cat.id?' selected':'')+'>'+esc(cat.name)+'</option>').join('')+'</select>'+(searchQuery||catFilter?'<button class="btn-ghost" onclick="searchQuery=\\'\\';catFilter=\\'\\';renderProducts()">Clear</button>':'')+'</div><div class="card"><div class="card-header"><h3>Products</h3><div style="display:flex;gap:8px"><button class="btn btn-outline btn-sm" onclick="seedData()">Seed Sample Data</button><button class="btn btn-primary btn-sm" onclick="openProductEditor()">Add Product</button></div></div><div class="card-muted">Displaying '+filtered.length+' product'+(filtered.length!==1?'s':'')+'</div>'+(filtered.length===0?'<div class="empty-state">No products found</div>':'<table><thead><tr><th style="width:30px"><input type="checkbox" class="cb" onclick="toggleAllCb(this)"></th><th>Product</th><th>Category</th><th>Price</th><th>Stock</th><th style="width:40px"></th></tr></thead><tbody>'+filtered.map(p=>{const cat=adminCategories.find(c=>c.id===p.category);const ts=p.variants?.reduce((s,v)=>s+(v.stock??0),0)??0;const firstSku=p.variants?.[0]?.sku||'';const thumb=p.images?.[0]?'<img src="'+esc(p.images[0])+'">':'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#c0c4cc" stroke-width="1.5"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3Z"/><circle cx="12" cy="13" r="3"/></svg>';return '<tr><td><input type="checkbox" class="cb"></td><td><div class="prod-cell"><div class="prod-thumb">'+thumb+'</div><div><div class="prod-name">'+esc(p.name)+'</div>'+(firstSku?'<div class="prod-sku">'+esc(firstSku)+'</div>':'')+'</div></div></td><td style="color:#6b7280">'+esc(cat?.name||'-')+'</td><td style="font-weight:600">$'+p.price.toFixed(2)+'</td><td>'+ts+'</td><td><button class="edit-btn" onclick="event.stopPropagation();openProductEditor(\\''+p.id+'\\')">${ICONS.edit}</button></td></tr>'}).join('')+'</tbody></table>')+'</div>'}
-function toggleAllCb(master){document.querySelectorAll('tbody .cb').forEach(cb=>cb.checked=master.checked)}
+  if(detailId)return renderOrderDetail(detailId);
 
-// ============ PRODUCT EDITOR (Full Page) ============
-function openProductEditor(prodId){const p=prodId?adminProducts.find(x=>x.id===prodId):null;currentTab='product-edit';
-document.querySelectorAll('.sidebar-nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab==='products'));
-setTopbar(p?'Edit Product':'New Product','<button class="btn btn-outline btn-sm" onclick="showTab(\\'products\\')">Cancel</button> <button class="btn btn-primary btn-sm" onclick="saveProduct('+(p?"'"+p.id+"'":'null')+')">Save Product</button>');
-window._editVariantTypes=p?JSON.parse(JSON.stringify(p.variantTypes||[])):[];
-window._editVariants=p?JSON.parse(JSON.stringify(p.variants||[])):[];
-window._editSupplyPrice=p?.supplyPrice||0;
-window._editRetailPrice=p?.price||0;
+  const c2=document.getElementById('admin-content');
+  c2.innerHTML='<div class="card"><div class="card-header"><h3>Recent Orders</h3><span style="font-size:12px;color:#6b7280">Manage fulfillment in Lightspeed POS</span></div>'+
+    (adminOrders.length===0?'<div class="empty-state">No orders yet</div>':
+    '<table><thead><tr><th>Order</th><th>Customer</th><th>Date</th><th>Items</th><th>Total</th><th>Lightspeed</th></tr></thead><tbody>'+
+    adminOrders.map(o=>{
+      const d=new Date(o.createdAt).toLocaleDateString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+      const ic=(o.items||[]).reduce((s,i)=>s+(i.qty||1),0);
+      const lsStatus=o.lightspeedSaleId?'<span class="badge-status badge-success">Synced</span>':(o.lightspeedSyncFailed?'<span class="badge-status badge-error">Failed</span>':'<span class="badge-status badge-warning">Pending</span>');
+      return '<tr style="cursor:pointer" onclick="renderOrders(\\''+o.id+'\\')"><td style="font-weight:600;color:#4f46e5">#'+o.id.slice(-6).toUpperCase()+'</td><td>'+esc(o.customer?.name||'-')+'</td><td style="color:#6b7280">'+d+'</td><td>'+ic+'</td><td style="font-weight:600">$'+(o.total||0).toFixed(2)+'</td><td>'+lsStatus+'</td></tr>';
+    }).join('')+'</tbody></table>')+
+  '</div>';
+}
 
-const c=document.getElementById('admin-content');
-c.innerHTML='<div style="max-width:900px">'+
-// Product Details
-'<div class="section-title">Product Details</div>'+
-'<div class="fg"><label>Name</label><input id="pf-name" value="'+esc(p?.name||'')+'"></div>'+
-'<div class="fg"><label>Description</label><textarea id="pf-desc">'+esc(p?.description||'')+'</textarea></div>'+
-'<div class="fg-row"><div class="fg"><label>Category</label><select id="pf-cat"><option value="">Select category</option>'+adminCategories.map(c=>'<option value="'+c.id+'"'+(p?.category===c.id?' selected':'')+'>'+esc(c.name)+'</option>').join('')+'</select></div><div class="fg"><label>Retail Price ($)</label><input id="pf-price" type="number" step="0.01" value="'+(p?.price||'')+'" onchange="window._editRetailPrice=parseFloat(this.value)||0;recalcPricing()"></div></div>'+
-// Images
-'<div class="section-title" style="margin-top:24px">Images</div>'+
-'<div class="img-preview" id="img-preview"'+(p?.images?.[0]?' style="display:block"':'')+'>'+(p?.images?.[0]?'<img src="'+esc(p.images[0])+'">':'')+'</div>'+
-'<div class="upload-zone"><p>${ICONS.upload}</p><p>Drag images here or browse to upload</p><button class="btn btn-primary btn-sm" onclick="document.getElementById(\\'pf-image\\').focus()">Choose Images</button></div>'+
-'<div class="fg"><label>Image URL</label><input id="pf-image" value="'+esc(p?.images?.[0]||'')+'" oninput="updateImgPreview(this.value)"></div>'+
-// Supplier
-'<div class="section-title" style="margin-top:24px">Supplier Information</div>'+
-'<div class="fg-row3"><div class="fg"><label>Supplier</label><input id="pf-supplier" value="'+esc(p?.supplier||'')+'"></div><div class="fg"><label>Supplier Code</label><input id="pf-supplier-code" value="'+esc(p?.supplierCode||'')+'"></div><div class="fg"><label>Supply Price ($)</label><input id="pf-supply-price" type="number" step="0.01" value="'+(p?.supplyPrice||'')+'" onchange="window._editSupplyPrice=parseFloat(this.value)||0;recalcPricing()"></div></div>'+
-// Pricing
-'<div class="section-title" style="margin-top:24px">Pricing</div>'+
-'<div class="pricing-row"><div class="fg"><label>Supply Price</label><input type="text" id="px-supply" readonly value="$'+(p?.supplyPrice||0).toFixed(2)+'" style="background:#f8f9fa;color:#6b7280"></div><div class="fg"><label>Markup %</label><input type="number" id="px-markup" step="0.1" onchange="calcFromMarkup()"></div><div class="fg"><label>Margin %</label><input type="number" id="px-margin" step="0.1" readonly style="background:#f8f9fa;color:#6b7280"></div><div class="fg"><label>Retail Price ($)</label><input type="number" id="px-retail" step="0.01" value="'+(p?.price||'')+'" onchange="calcFromRetail()"></div></div>'+
-// Variants
-'<div class="section-title" style="margin-top:24px">Variant Configuration</div>'+
-'<div id="vt-container"></div><button class="btn btn-outline btn-sm" onclick="addVariantType()" style="margin-top:8px">+ Add Variant Type</button>'+
-'<div class="section-title" style="margin-top:24px">Inventory & Pricing</div>'+
-'<div id="var-container"></div><button class="btn btn-outline btn-sm" onclick="generateVariants()" style="margin-top:8px">Generate Variant Combinations</button>'+
-// Delete
-(p?'<div style="margin-top:32px;padding-top:16px;border-top:1px solid #e5e7eb"><button class="btn-ghost" style="color:#dc2626" onclick="if(confirm(\\'Delete this product? This cannot be undone.\\'))deleteProduct(\\''+p.id+'\\')">Delete this product</button></div>':'')+
-'</div>';
-renderVariantTypes();renderVariants();recalcPricing()}
-
-function updateImgPreview(url){const prev=document.getElementById('img-preview');if(url){prev.style.display='block';prev.innerHTML='<img src="'+esc(url)+'">';} else{prev.style.display='none';prev.innerHTML=''}}
-function recalcPricing(){const sp=window._editSupplyPrice||0;const rp=window._editRetailPrice||0;document.getElementById('px-supply').value='$'+sp.toFixed(2);document.getElementById('px-retail').value=rp||'';if(sp>0&&rp>0){const markup=((rp-sp)/sp)*100;const margin=((rp-sp)/rp)*100;document.getElementById('px-markup').value=markup.toFixed(1);document.getElementById('px-margin').value=margin.toFixed(1)}else{document.getElementById('px-markup').value='';document.getElementById('px-margin').value=''}}
-function calcFromMarkup(){const sp=window._editSupplyPrice||0;const markup=parseFloat(document.getElementById('px-markup').value)||0;if(sp>0){const rp=sp*(1+markup/100);window._editRetailPrice=rp;document.getElementById('pf-price').value=rp.toFixed(2);recalcPricing()}}
-function calcFromRetail(){const rp=parseFloat(document.getElementById('px-retail').value)||0;window._editRetailPrice=rp;document.getElementById('pf-price').value=rp.toFixed(2);recalcPricing()}
-
-function addVariantType(){window._editVariantTypes.push({name:'',options:[]});renderVariantTypes()}
-function removeVariantType(i){window._editVariantTypes.splice(i,1);renderVariantTypes()}
-function getAllAttributes(){return [...new Set([...PRESETS,...customAttributes])]}
-function renderVariantTypes(){const c=document.getElementById('vt-container');if(!c)return;
-c.innerHTML=window._editVariantTypes.map((vt,i)=>{const allAttrs=getAllAttributes();return '<div class="vt-row"><div style="flex:1" class="combobox"><input value="'+esc(vt.name)+'" placeholder="Type or select attribute..." onfocus="showComboList('+i+')" oninput="filterComboList('+i+',this.value)" onkeydown="comboKeydown(event,'+i+')" id="vt-name-'+i+'"><div class="combobox-list" id="vt-list-'+i+'">'+allAttrs.map(a=>'<div onclick="selectAttr('+i+',\\''+esc(a)+'\\')">'+esc(a)+'</div>').join('')+'</div></div><div style="flex:2" id="vt-opts-'+i+'"></div><button class="vt-remove" onclick="removeVariantType('+i+')">${ICONS.x}</button></div>'}).join('');
-window._editVariantTypes.forEach((vt,i)=>{const wrap=document.getElementById('vt-opts-'+i);if(wrap)renderTagInput(wrap,vt.options,o=>{window._editVariantTypes[i].options=o})})}
-function showComboList(i){document.getElementById('vt-list-'+i).classList.add('show');setTimeout(()=>document.addEventListener('click',function h(e){if(!e.target.closest('.combobox')){document.querySelectorAll('.combobox-list').forEach(l=>l.classList.remove('show'));document.removeEventListener('click',h)}},{once:false}),10)}
-function filterComboList(i,val){const list=document.getElementById('vt-list-'+i);const allAttrs=getAllAttributes();const q=val.toLowerCase();list.innerHTML=allAttrs.filter(a=>a.toLowerCase().includes(q)).map(a=>'<div onclick="selectAttr('+i+',\\''+esc(a)+'\\')">'+esc(a)+'</div>').join('');if(!list.innerHTML&&val.trim())list.innerHTML='<div onclick="createCustomAttr('+i+',\\''+esc(val.trim())+'\\')">Create "'+esc(val.trim())+'"</div>';list.classList.add('show');window._editVariantTypes[i].name=val}
-function comboKeydown(e,i){if(e.key==='Enter'){e.preventDefault();const val=document.getElementById('vt-name-'+i).value.trim();if(val){const allAttrs=getAllAttributes();if(allAttrs.includes(val)){selectAttr(i,val)}else{createCustomAttr(i,val)}}}}
-function selectAttr(i,name){window._editVariantTypes[i].name=name;document.getElementById('vt-name-'+i).value=name;document.querySelectorAll('.combobox-list').forEach(l=>l.classList.remove('show'));
-const defaults={Size:['S','M','L','XL','2XL'],Color:['Black','White','Navy'],Hand:['Left','Right'],Flex:['75','85','95'],Curve:['P92','P88','P28','P29']};if(defaults[name]&&!window._editVariantTypes[i].options.length){window._editVariantTypes[i].options=[...defaults[name]];renderVariantTypes()}}
-async function createCustomAttr(i,name){window._editVariantTypes[i].name=name;document.getElementById('vt-name-'+i).value=name;document.querySelectorAll('.combobox-list').forEach(l=>l.classList.remove('show'));if(!customAttributes.includes(name)){await fetch('/api/admin/custom-attributes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});customAttributes.push(name)}showToast('Custom attribute "'+name+'" created')}
-
-function renderTagInput(container,tags,onChange){const wrap=document.createElement('div');wrap.className='tag-wrap';function render(){wrap.innerHTML='';tags.forEach((t,i)=>{const el=document.createElement('span');el.className='tag';el.innerHTML=esc(t)+'<span class="rm">'+IC.x+'</span>';el.querySelector('.rm').addEventListener('click',e=>{e.stopPropagation();tags.splice(i,1);onChange(tags);render()});wrap.appendChild(el)});const inp=document.createElement('input');inp.placeholder='Type & press Enter';inp.addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===',')&&inp.value.trim()){e.preventDefault();const val=inp.value.trim().replace(/,$/,'');if(val&&!tags.includes(val)){tags.push(val);onChange(tags)}inp.value='';render()}if(e.key==='Backspace'&&!inp.value&&tags.length){tags.pop();onChange(tags);render()}});wrap.appendChild(inp);wrap.addEventListener('click',()=>inp.focus())}render();container.innerHTML='';container.appendChild(wrap)}
-function generateVariants(){const types=window._editVariantTypes.filter(vt=>vt.name&&vt.options.length);if(!types.length){showToast('Add variant types first');return}let combos=[{}];for(const vt of types){const nc=[];for(const c of combos)for(const o of vt.options)nc.push({...c,[vt.name]:o});combos=nc}const existing=window._editVariants||[];const sp=window._editSupplyPrice||0;const rp=window._editRetailPrice||0;
-window._editVariants=combos.map(opts=>{const match=existing.find(v=>Object.entries(opts).every(([k,val])=>v.options?.[k]===val));return match||{id:generateId('var'),sku:'',supplierCode:'',supplyPrice:sp,retailPrice:rp,options:opts,stock:0,enabled:true}});renderVariants();showToast('Generated '+combos.length+' variant(s)')}
-function renderVariants(){const c=document.getElementById('var-container');if(!c)return;if(!window._editVariants?.length){c.innerHTML='<p style="color:#6b7280;font-size:13px">No variants. Generate from variant types above.</p>';return}
-c.innerHTML='<div style="overflow-x:auto"><table class="vs-table"><thead><tr><th>Variant</th><th>SKU <span class="apply-link" onclick="applyAll(\\'sku\\')">Apply to All</span></th><th>Supplier Code</th><th>Supply Price ($) <span class="apply-link" onclick="applyAll(\\'supplyPrice\\')">Apply to All</span></th><th>Retail Price ($) <span class="apply-link" onclick="applyAll(\\'retailPrice\\')">Apply to All</span></th><th>Stock <span class="apply-link" onclick="applyAll(\\'stock\\')">Apply to All</span></th><th>Enabled</th><th style="width:30px"></th></tr></thead><tbody>'+
-window._editVariants.map((v,i)=>{const vn=Object.values(v.options).join(' / ');const en=v.enabled!==false;
-return '<tr><td style="font-size:12px;color:#374151;font-weight:500;white-space:nowrap">'+esc(vn)+'</td>'+
-'<td><input style="width:100px" value="'+esc(v.sku||'')+'" onchange="window._editVariants['+i+'].sku=this.value"></td>'+
-'<td><input style="width:90px" value="'+esc(v.supplierCode||'')+'" onchange="window._editVariants['+i+'].supplierCode=this.value"></td>'+
-'<td><input type="number" step="0.01" style="width:80px" value="'+(v.supplyPrice||'')+'" onchange="window._editVariants['+i+'].supplyPrice=parseFloat(this.value)||0"></td>'+
-'<td><input type="number" step="0.01" style="width:80px" value="'+(v.retailPrice||'')+'" onchange="window._editVariants['+i+'].retailPrice=parseFloat(this.value)||0"></td>'+
-'<td><input type="number" min="0" style="width:60px" value="'+(v.stock??0)+'" onchange="window._editVariants['+i+'].stock=parseInt(this.value)||0"></td>'+
-'<td><label class="toggle"><input type="checkbox" '+(en?'checked':'')+' onchange="window._editVariants['+i+'].enabled=this.checked"><span class="toggle-slider"></span></label></td>'+
-'<td><button class="vs-remove" onclick="window._editVariants.splice('+i+',1);renderVariants()">${ICONS.trash}</button></td></tr>'}).join('')+'</tbody></table></div>'}
-function applyAll(field){if(!window._editVariants?.length)return;const first=window._editVariants[0];window._editVariants.forEach(v=>v[field]=first[field]);renderVariants();showToast('Applied to all variants')}
-function generateId(prefix){return prefix+'_'+Date.now().toString(36)+'_'+Math.random().toString(36).substr(2,6)}
-async function saveProduct(existingId){const product={id:existingId||undefined,name:document.getElementById('pf-name').value.trim(),description:document.getElementById('pf-desc').value.trim(),category:document.getElementById('pf-cat').value,price:parseFloat(document.getElementById('pf-price').value)||0,images:document.getElementById('pf-image').value.trim()?[document.getElementById('pf-image').value.trim()]:[],supplier:document.getElementById('pf-supplier').value.trim(),supplierCode:document.getElementById('pf-supplier-code').value.trim(),supplyPrice:parseFloat(document.getElementById('pf-supply-price').value)||0,variantTypes:window._editVariantTypes.filter(vt=>vt.name&&vt.options.length),variants:window._editVariants||[],active:true};if(!product.name){showToast('Product name is required');return}if(!product.price){showToast('Price is required');return}
-await fetch('/api/admin/product',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(product)});await loadAdmin();showTab('products');showToast(existingId?'Product updated':'Product added')}
-async function deleteProduct(id){await fetch('/api/admin/product/'+id,{method:'DELETE'});await loadAdmin();showTab('products');showToast('Product deleted')}
-async function seedData(){if(!confirm('Seed sample catalog data?'))return;await fetch('/api/admin/seed',{method:'POST'});await loadAdmin();showTab('products');showToast('Sample data loaded')}
-
-// ============ CATEGORIES ============
-function renderCategories(){setTopbar('Categories');const c=document.getElementById('admin-content');c.innerHTML='<div class="card"><div class="card-header"><h3>Categories</h3><button class="btn btn-primary btn-sm" onclick="openCategoryModal()">Add Category</button></div>'+(adminCategories.length===0?'<div class="empty-state">No categories yet</div>':'<table><thead><tr><th>Name</th><th>Description</th><th>Order</th><th style="width:40px"></th></tr></thead><tbody>'+adminCategories.map(cat=>'<tr><td style="font-weight:500">'+esc(cat.name)+'</td><td style="color:#6b7280">'+esc(cat.description)+'</td><td>'+(cat.order||0)+'</td><td><button class="edit-btn" onclick="openCategoryModal(\\''+cat.id+'\\')">${ICONS.edit}</button></td></tr>').join('')+'</tbody></table>')+'</div>'}
-function openCategoryModal(catId){const cat=catId?adminCategories.find(c=>c.id===catId):null;const modal=document.createElement('div');modal.className='modal-overlay';modal.onclick=e=>{if(e.target===modal)modal.remove()};modal.innerHTML='<div class="modal"><div class="modal-header"><h2>'+(cat?'Edit':'Add')+' Category</h2><button class="modal-close" onclick="this.closest(\\'.modal-overlay\\').remove()">${ICONS.x}</button></div><div class="modal-body"><div class="fg"><label>Name</label><input id="cf-name" value="'+esc(cat?.name||'')+'"></div><div class="fg"><label>Description</label><textarea id="cf-desc">'+esc(cat?.description||'')+'</textarea></div><div class="fg"><label>Display Order</label><input id="cf-order" type="number" value="'+(cat?.order||0)+'"></div></div><div class="modal-footer">'+(cat?'<button class="btn-ghost" style="color:#dc2626;margin-right:auto" onclick="if(confirm(\\'Delete this category?\\'))deleteCategory(\\''+cat.id+'\\')">Delete</button>':'')+
-'<button class="btn-ghost" onclick="this.closest(\\'.modal-overlay\\').remove()">Cancel</button><button class="btn btn-primary" onclick="saveCategory('+(cat?"'"+cat.id+"'":'null')+')">Save</button></div></div>';document.body.appendChild(modal)}
-async function saveCategory(existingId){const category={id:existingId||undefined,name:document.getElementById('cf-name').value.trim(),description:document.getElementById('cf-desc').value.trim(),order:parseInt(document.getElementById('cf-order').value)||0};if(!category.name){showToast('Name is required');return}await fetch('/api/admin/category',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(category)});document.querySelector('.modal-overlay')?.remove();await loadAdmin();showTab('categories');showToast(existingId?'Category updated':'Category added')}
-async function deleteCategory(id){await fetch('/api/admin/category/'+id,{method:'DELETE'});document.querySelector('.modal-overlay')?.remove();await loadAdmin();showTab('categories');showToast('Category deleted')}
+function renderOrderDetail(orderId){
+  const o=adminOrders.find(x=>x.id===orderId);
+  if(!o)return;
+  setTopbar('Order #'+o.id.slice(-6).toUpperCase());
+  const c=document.getElementById('admin-content');
+  const d=new Date(o.createdAt).toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'});
+  c.innerHTML='<a class="back-link" onclick="renderOrders()">${ICONS.back} Back to Orders</a>'+
+    '<div class="card"><div style="padding:20px 24px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between"><span style="font-size:18px;font-weight:700">#'+o.id.slice(-6).toUpperCase()+'</span>'+
+    (o.lightspeedSaleId?'<span class="badge-status badge-success">Synced to Lightspeed</span>':(o.lightspeedSyncFailed?'<span class="badge-status badge-error">Lightspeed sync failed</span>':'<span class="badge-status badge-warning">Processing</span>'))+
+    '</div>'+
+    '<div class="od-info"><div class="od-info-item"><label>Customer</label><span>'+esc(o.customer?.name||'-')+'</span></div><div class="od-info-item"><label>Email</label><span>'+esc(o.customer?.email||'-')+'</span></div><div class="od-info-item"><label>Phone</label><span>'+esc(o.customer?.phone||'-')+'</span></div></div>'+
+    '<div class="od-info"><div class="od-info-item"><label>Order Date</label><span>'+d+'</span></div><div class="od-info-item"><label>Lightspeed Sale</label><span style="font-size:12px;color:#6b7280">'+(o.lightspeedSaleId||'N/A')+'</span></div><div class="od-info-item"><label>Stripe PI</label><span style="font-size:12px;color:#6b7280">'+(o.stripePaymentIntent||'-')+'</span></div></div>'+
+    '<div style="padding:0 24px"><table><thead><tr><th>Product</th><th>Variant</th><th>Qty</th><th>Price</th><th>Total</th></tr></thead><tbody>'+
+    (o.items||[]).map(item=>'<tr><td style="font-weight:500">'+esc(item.name||'Product')+'</td><td style="color:#6b7280;font-size:12px">'+esc(item.variantName||'-')+'</td><td>'+item.qty+'</td><td>$'+((item.teamPrice||item.price||0)).toFixed(2)+'</td><td style="font-weight:600">$'+((item.teamPrice||item.price||0)*item.qty).toFixed(2)+'</td></tr>').join('')+
+    '</tbody></table></div>'+
+    '<div style="padding:16px 24px;border-top:1px solid #e5e7eb;display:flex;justify-content:flex-end;gap:24px;font-weight:600"><span>Total</span><span style="font-size:18px">$'+(o.total||0).toFixed(2)+'</span></div>'+
+    '<div style="padding:16px 24px;border-top:1px solid #e5e7eb;color:#6b7280;font-size:13px">Manage order fulfillment in Lightspeed POS</div>'+
+  '</div>';
+}
 
 // ============ SETTINGS ============
-function renderSettings(){setTopbar('Settings');const c=document.getElementById('admin-content');c.innerHTML='<div id="settings-content">Loading...</div>';loadSettings()}
-async function loadSettings(){const r=await fetch('/api/admin/config');const config=await r.json();document.getElementById('settings-content').innerHTML='<div class="settings-card"><h3>Store Configuration</h3><div class="fg"><label>Store Name</label><input id="sf-name" value="'+esc(config.storeName||'')+'"></div><div class="fg-row"><div class="fg"><label>Store PIN (customer access)</label><input id="sf-pin" value="'+esc(config.storePin||'')+'"></div><div class="fg"><label>Admin PIN</label><input id="sf-admin-pin" value="'+esc(config.adminPin||'')+'"></div></div><button class="btn btn-primary" onclick="saveSettings(\\'store\\')">Save Store Settings</button></div><div class="settings-card"><h3>Payment Configuration</h3><div class="fg"><label>Stripe Publishable Key</label><input id="sf-stripe-pk" value="'+esc(config.stripePublishableKey||'')+'"></div><div class="fg"><label>Stripe Secret Key</label><input id="sf-stripe-sk" type="password" value="'+esc(config.stripeSecretKey||'')+'"></div><div class="fg"><label>Stripe Webhook Secret</label><input id="sf-stripe-wh" type="password" value="'+esc(config.stripeWebhookSecret||'')+'"></div><button class="btn btn-primary" onclick="saveSettings(\\'payment\\')">Save Payment Settings</button></div>'}
-async function saveSettings(section){let config={};if(section==='store'){config={storeName:document.getElementById('sf-name').value.trim(),storePin:document.getElementById('sf-pin').value.trim(),adminPin:document.getElementById('sf-admin-pin').value.trim()}}else{config={stripePublishableKey:document.getElementById('sf-stripe-pk').value.trim(),stripeSecretKey:document.getElementById('sf-stripe-sk').value.trim(),stripeWebhookSecret:document.getElementById('sf-stripe-wh').value.trim()}}await fetch('/api/admin/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(config)});showToast('Settings saved')}
+function renderSettings(){
+  setTopbar('Settings');
+  const c=document.getElementById('admin-content');
+  c.innerHTML='<div id="settings-content">Loading...</div>';
+  loadSettings();
+}
+
+async function loadSettings(){
+  const r=await fetch('/api/admin/config');
+  const config=await r.json();
+  document.getElementById('settings-content').innerHTML=
+    '<div class="settings-card"><h3>Store Configuration</h3>'+
+      '<div class="fg"><label>Store Name</label><input id="sf-name" value="'+esc(config.storeName||'')+'"></div>'+
+      '<div class="fg-row"><div class="fg"><label>Store PIN (customer access)</label><input id="sf-pin" value="'+esc(config.storePin||'')+'"></div><div class="fg"><label>Admin PIN</label><input id="sf-admin-pin" value="'+esc(config.adminPin||'')+'"></div></div>'+
+      '<button class="btn btn-primary" onclick="saveSettings(\\'store\\')">Save Store Settings</button>'+
+    '</div>'+
+
+    '<div class="settings-card"><h3>Lightspeed Integration</h3>'+
+      '<div class="fg"><label>Team Discount %</label><input id="sf-discount" type="number" value="'+(config.discountPercent||15)+'" min="0" max="100"></div>'+
+      '<div style="display:flex;gap:8px;margin-bottom:16px"><button class="btn btn-outline btn-sm" onclick="testLightspeed()" id="test-ls-btn">${ICONS.link} Test Connection</button><button class="btn btn-primary btn-sm" onclick="syncProducts()" id="sync-ls-btn">${ICONS.sync} Sync Products</button></div>'+
+      '<div id="ls-test-result"></div>'+
+      '<p style="font-size:12px;color:#6b7280;margin-top:8px">API token and domain prefix are set via wrangler secrets (LIGHTSPEED_API_TOKEN, LIGHTSPEED_DOMAIN_PREFIX).</p>'+
+      '<p style="font-size:12px;color:#6b7280;margin-top:4px">Last sync: '+(syncTimestamp?new Date(syncTimestamp).toLocaleString():'Never')+'</p>'+
+      '<p style="font-size:12px;color:#6b7280;margin-top:4px">Auto-sync runs every 30 minutes via cron trigger.</p>'+
+      '<button class="btn btn-primary" onclick="saveSettings(\\'lightspeed\\')">Save Lightspeed Settings</button>'+
+    '</div>'+
+
+    '<div class="settings-card"><h3>Payment Configuration</h3>'+
+      '<div class="fg"><label>Stripe Publishable Key</label><input id="sf-stripe-pk" value="'+esc(config.stripePublishableKey||'')+'"></div>'+
+      '<div class="fg"><label>Stripe Secret Key</label><input id="sf-stripe-sk" type="password" value="'+esc(config.stripeSecretKey||'')+'"></div>'+
+      '<div class="fg"><label>Stripe Webhook Secret</label><input id="sf-stripe-wh" type="password" value="'+esc(config.stripeWebhookSecret||'')+'"></div>'+
+      '<button class="btn btn-primary" onclick="saveSettings(\\'payment\\')">Save Payment Settings</button>'+
+    '</div>';
+}
+
+async function testLightspeed(){
+  const btn=document.getElementById('test-ls-btn');
+  const result=document.getElementById('ls-test-result');
+  btn.disabled=true;btn.textContent='Testing...';
+  try{
+    const r=await fetch('/api/admin/lightspeed/test');
+    const data=await r.json();
+    if(data.success){result.innerHTML='<span class="badge-status badge-success">'+esc(data.message)+'</span>'}
+    else{result.innerHTML='<span class="badge-status badge-error">'+esc(data.error)+'</span>'}
+  }catch(e){result.innerHTML='<span class="badge-status badge-error">Connection error</span>'}
+  finally{btn.disabled=false;btn.innerHTML=IC.link+' Test Connection'}
+}
+
+async function saveSettings(section){
+  let config={};
+  if(section==='store'){
+    config={storeName:document.getElementById('sf-name').value.trim(),storePin:document.getElementById('sf-pin').value.trim(),adminPin:document.getElementById('sf-admin-pin').value.trim()};
+  }else if(section==='lightspeed'){
+    config={discountPercent:parseInt(document.getElementById('sf-discount').value)||15};
+  }else{
+    config={stripePublishableKey:document.getElementById('sf-stripe-pk').value.trim(),stripeSecretKey:document.getElementById('sf-stripe-sk').value.trim(),stripeWebhookSecret:document.getElementById('sf-stripe-wh').value.trim()};
+  }
+  await fetch('/api/admin/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(config)});
+  showToast('Settings saved');
+}
 
 function showToast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2500)}
 function esc(s){if(!s)return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
