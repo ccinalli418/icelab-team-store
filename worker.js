@@ -1104,29 +1104,27 @@ function renderImportTable(team){
       if(!parentMap[p.parentId])parentMap[p.parentId]={products:[],name:p.name};
       parentMap[p.parentId].products.push(p);
     }else{
-      standalone.push(p);
+      // Check if this standalone IS a parent that has children
+      if(!parentMap[p.lightspeedProductId]) standalone.push(p);
     }
   }
 
-  // Build flat list with parent grouping
-  let displayList=[];
+  // Build parent groups
+  let groups=[];
   for(const[parentId,group] of Object.entries(parentMap)){
-    displayList.push({isParent:true,parentId,name:group.name,variantCount:group.products.length,totalStock:group.products.reduce((s,p)=>s+(p.stock||0),0),teamPrice:Math.min(...group.products.map(p=>p.teamPrice||999999)),retailPrice:Math.min(...group.products.map(p=>p.retailPrice||999999)),imageUrl:group.products.find(p=>p.imageUrl)?.imageUrl||null});
-    for(const p of group.products){
-      displayList.push({...p,isChild:true});
-    }
+    const totalStock=group.products.reduce((s,p)=>s+(p.stock||0),0);
+    const minTeam=Math.min(...group.products.map(p=>p.teamPrice||999999));
+    const minRetail=Math.min(...group.products.map(p=>p.retailPrice||999999));
+    groups.push({parentId,name:group.name,variantCount:group.products.length,totalStock,teamPrice:minTeam,retailPrice:minRetail,imageUrl:group.products.find(p=>p.imageUrl)?.imageUrl||null,variants:group.products});
   }
   for(const p of standalone){
-    displayList.push(p);
+    groups.push({parentId:p.lightspeedProductId,name:p.name,variantCount:0,totalStock:p.stock||0,teamPrice:p.teamPrice,retailPrice:p.retailPrice,imageUrl:p.imageUrl,variants:[]});
   }
 
   // Filter
-  let filtered=displayList;
-  if(searchQuery){const q=searchQuery.toLowerCase();filtered=filtered.filter(p=>(p.name||'').toLowerCase().includes(q)||(p.sku||'').toLowerCase().includes(q)||(p.variantLabel||'').toLowerCase().includes(q)||(p.variantName||'').toLowerCase().includes(q))}
+  if(searchQuery){const q=searchQuery.toLowerCase();groups=groups.filter(g=>(g.name||'').toLowerCase().includes(q)||g.variants.some(v=>(v.sku||'').toLowerCase().includes(q)||(v.variantLabel||'').toLowerCase().includes(q)||(v.variantName||'').toLowerCase().includes(q)))}
 
   const enabledTeams=adminTeams.filter(t=>t.enabled&&t.priceBookId);
-
-  // Stats
   const totalItems=importProducts.length;
   const totalStock=importProducts.reduce((s,p)=>s+(p.stock||0),0);
   const parentCount=Object.keys(parentMap).length+standalone.length;
@@ -1142,17 +1140,19 @@ function renderImportTable(team){
   html+='<div class="card"><div class="card-header"><h3>'+esc(team.name)+' - Price Book Products</h3></div>';
   html+='<div class="search-bar"><div class="search-input"><span class="search-icon">${ICONS.search}</span><input id="import-search" placeholder="Search by name, SKU, variant..." value="'+esc(searchQuery)+'" oninput="searchQuery=this.value;renderImportTable(adminTeams.filter(t=>t.enabled&&t.priceBookId)[selectedTeamIdx])"></div></div>';
 
-  if(filtered.length===0){
+  if(groups.length===0){
     html+='<div class="empty-state">'+(importProducts.length===0?'No products in this price book. Click "Sync Price Book" to load.':'No products match your search.')+'</div>';
   }else{
-    html+='<div style="overflow-x:auto"><table><thead><tr><th>Product</th><th>Variant</th><th>SKU</th><th>Retail</th><th>Team Price</th><th>Stock</th></tr></thead><tbody>';
-    for(const p of filtered){
-      if(p.isParent){
-        html+='<tr style="background:#f5f3ff"><td colspan="3"><strong>'+esc(p.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+p.variantCount+' variants)</span></td><td style="color:#9ca3af;font-size:12px">from $'+(p.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600">from $'+(p.teamPrice||0).toFixed(2)+'</td><td>'+p.totalStock+'</td></tr>';
-      }else{
-        const indent=p.isChild?'padding-left:32px':'';
-        const thumb=p.imageUrl?'<img src="'+esc(p.imageUrl)+'" style="width:28px;height:28px;border-radius:3px;object-fit:cover">':'';
-        html+='<tr><td style="'+indent+'"><div class="prod-cell">'+(thumb?'<div class="prod-thumb">'+thumb+'</div>':'')+'<div class="prod-name">'+esc(p.isChild?'':p.name)+'</div></div></td><td style="color:#6b7280;font-size:12px">'+esc(p.variantLabel||p.variantName||'-')+'</td><td style="color:#6b7280;font-size:12px">'+esc(p.sku||'-')+'</td><td>$'+(p.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600;color:#4f46e5">$'+(p.teamPrice||0).toFixed(2)+'</td><td>'+(p.stock>0?'<span class="badge-status badge-success">'+p.stock+'</span>':'<span class="badge-status badge-info">0</span>')+'</td></tr>';
+    html+='<div style="overflow-x:auto"><table><thead><tr><th style="width:30px"></th><th>Product</th><th>SKU</th><th>Retail</th><th>Team Price</th><th>Stock</th></tr></thead><tbody>';
+    for(const g of groups){
+      const hasVariants=g.variants.length>0;
+      const chevron=hasVariants?'<button class="edit-btn" onclick="event.stopPropagation();toggleVariants(\\''+g.parentId+'\\',this)" style="transition:transform 0.15s;transform:rotate(-90deg)">${ICONS.back}</button>':'';
+      html+='<tr style="cursor:'+(hasVariants?'pointer':'default')+'" '+(hasVariants?'onclick="toggleVariants(\\''+g.parentId+'\\',this.querySelector(\\'button\\'))"':'')+'><td style="text-align:center">'+chevron+'</td><td><strong>'+esc(g.name)+'</strong>'+(hasVariants?' <span style="color:#6b7280;font-size:11px">('+g.variantCount+' variants)</span>':'')+'</td><td style="color:#6b7280;font-size:12px">-</td><td style="color:#6b7280;font-size:12px">'+(hasVariants?'from ':'')+'$'+(g.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600;color:#4f46e5">'+(hasVariants?'from ':'')+'$'+(g.teamPrice||0).toFixed(2)+'</td><td>'+g.totalStock+'</td></tr>';
+      // Variant rows - hidden by default
+      if(hasVariants){
+        for(const v of g.variants){
+          html+='<tr class="variant-row vr-'+g.parentId+'" style="display:none"><td></td><td style="padding-left:32px;color:#6b7280;font-size:12px">'+esc(v.variantLabel||v.variantName||'-')+'</td><td style="color:#6b7280;font-size:12px">'+esc(v.sku||'-')+'</td><td style="font-size:12px">$'+(v.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600;color:#4f46e5;font-size:12px">$'+(v.teamPrice||0).toFixed(2)+'</td><td>'+(v.stock>0?'<span class="badge-status badge-success">'+v.stock+'</span>':'<span style="color:#9ca3af;font-size:12px">0</span>')+'</td></tr>';
+        }
       }
     }
     html+='</tbody></table></div>';
@@ -1161,6 +1161,12 @@ function renderImportTable(team){
   c.innerHTML=html;
 }
 
+function toggleVariants(parentId,btn){
+  const rows=document.querySelectorAll('.vr-'+parentId);
+  const showing=rows[0]&&rows[0].style.display!=='none';
+  rows.forEach(r=>r.style.display=showing?'none':'table-row');
+  if(btn)btn.style.transform=showing?'rotate(-90deg)':'rotate(0deg)';
+}
 async function syncTeam(priceBookId,teamName){
   const btn=document.getElementById('sync-btn');
   if(btn){btn.disabled=true;btn.innerHTML='Syncing...';}
