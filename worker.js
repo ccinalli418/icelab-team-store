@@ -1096,17 +1096,22 @@ async function renderImport(){
 function renderImportTable(team){
   const c=document.getElementById('admin-content');
 
-  // Group by parent
+  // Two-pass grouping: first collect all parentIds, then assign
   const parentMap={};
-  const standalone=[];
+  const childProducts=[];
+  const parentProducts=[];
+  // Pass 1: identify all parentIds from children
   for(const p of importProducts){
     if(p.parentId){
+      childProducts.push(p);
       if(!parentMap[p.parentId])parentMap[p.parentId]={products:[],name:p.name};
-      parentMap[p.parentId].products.push(p);
     }else{
-      // Check if this standalone IS a parent that has children
-      if(!parentMap[p.lightspeedProductId]) standalone.push(p);
+      parentProducts.push(p);
     }
+  }
+  // Pass 2: add children to their groups
+  for(const p of childProducts){
+    parentMap[p.parentId].products.push(p);
   }
 
   // Build parent groups
@@ -1117,8 +1122,11 @@ function renderImportTable(team){
     const minRetail=Math.min(...group.products.map(p=>p.retailPrice||999999));
     groups.push({parentId,name:group.name,variantCount:group.products.length,totalStock,teamPrice:minTeam,retailPrice:minRetail,imageUrl:group.products.find(p=>p.imageUrl)?.imageUrl||null,variants:group.products});
   }
-  for(const p of standalone){
-    groups.push({parentId:p.lightspeedProductId,name:p.name,variantCount:0,totalStock:p.stock||0,teamPrice:p.teamPrice,retailPrice:p.retailPrice,imageUrl:p.imageUrl,variants:[]});
+  // Only add truly standalone products (not parent products whose children are already grouped)
+  for(const p of parentProducts){
+    if(!parentMap[p.lightspeedProductId]){
+      groups.push({parentId:p.lightspeedProductId,name:p.name,variantCount:0,totalStock:p.stock||0,teamPrice:p.teamPrice,retailPrice:p.retailPrice,imageUrl:p.imageUrl,variants:[]});
+    }
   }
 
   // Filter
@@ -1127,7 +1135,7 @@ function renderImportTable(team){
   const enabledTeams=adminTeams.filter(t=>t.enabled&&t.priceBookId);
   const totalItems=importProducts.length;
   const totalStock=importProducts.reduce((s,p)=>s+(p.stock||0),0);
-  const parentCount=Object.keys(parentMap).length+standalone.length;
+  const parentCount=groups.length;
 
   let html='<div class="stat-cards">'+
     '<div class="stat-card"><div class="label">Price Book Items</div><div class="value">'+totalItems+'</div></div>'+
