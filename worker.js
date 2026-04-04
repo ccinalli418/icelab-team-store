@@ -86,6 +86,7 @@ async function lsFetchAll(env, endpoint) {
   let all = [];
   let after = 0;
   let pages = 0;
+  const seen = new Set();
   while (pages < 50) {
     const sep = endpoint.includes('?') ? '&' : '?';
     const url = `${lsApi(env)}/${endpoint}${after ? `${sep}after=${after}` : ''}`;
@@ -96,7 +97,13 @@ async function lsFetchAll(env, endpoint) {
     }
     const data = await resp.json();
     const key = Object.keys(data).find(k => Array.isArray(data[k]));
-    if (key) all = all.concat(data[key]);
+    if (key) {
+      // Deduplicate by id or product_id
+      for (const item of data[key]) {
+        const uid = item.product_id || item.id;
+        if (!seen.has(uid)) { seen.add(uid); all.push(item); }
+      }
+    }
     if (data.version && data.version.max && data.version.max > after) {
       after = data.version.max;
       pages++;
@@ -276,21 +283,30 @@ function groupByParent(products) {
       }
       parents[p.parentId].totalStock += (p.stock || 0);
       parents[p.parentId].variants.push(p);
-      // Use first image found
       if (!parents[p.parentId].imageUrl && p.imageUrl) {
         parents[p.parentId].imageUrl = p.imageUrl;
       }
-      // Use lowest team price for card display
       if (p.teamPrice < parents[p.parentId].teamPrice) {
         parents[p.parentId].teamPrice = p.teamPrice;
         parents[p.parentId].retailPrice = p.retailPrice;
       }
     } else {
-      standalone.push({ ...p, id: p.lightspeedProductId, totalStock: p.stock || 0, hasVariants: false, variants: [] });
+      standalone.push(p);
     }
   }
 
-  return [...Object.values(parents), ...standalone];
+  // Merge standalones into existing parent groups if their product ID matches a parent group ID
+  // (happens when price book includes both parent and child products)
+  const result = [...Object.values(parents)];
+  for (const s of standalone) {
+    if (parents[s.lightspeedProductId]) {
+      // This standalone IS the parent product — already represented by its children group, skip it
+      continue;
+    }
+    result.push({ ...s, id: s.lightspeedProductId, totalStock: s.stock || 0, hasVariants: false, variants: [] });
+  }
+
+  return result;
 }
 
 async function apiGetProducts(url, env) {
