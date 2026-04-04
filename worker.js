@@ -171,13 +171,14 @@ async function syncPriceBook(env, priceBookId) {
       }
       const cleanName = product.name || parentName;
 
-      // Fetch inventory for this product
+      // Fetch inventory for this product via /products/{id}/inventory
       let stock = 0;
       try {
-        const invResp = await fetch(`${lsApi(env)}/inventory?product_id=${pbp.product_id}`, { headers: lsHeaders(env) });
+        const invResp = await fetch(`${lsApi(env)}/products/${pbp.product_id}/inventory`, { headers: lsHeaders(env) });
         if (invResp.ok) {
           const invData = await invResp.json();
           const inv = invData.data || [];
+          // Sum inventory_level across outlets (typically just one outlet)
           stock = inv.reduce((sum, i) => sum + (i.inventory_level || 0), 0);
         }
       } catch (e) { /* inventory fetch failed, default 0 */ }
