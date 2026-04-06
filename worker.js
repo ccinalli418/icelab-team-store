@@ -1493,6 +1493,7 @@ function adminPage() {
 .admin-content{padding:32px;flex:1;overflow-y:auto}
 .card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.08);margin-bottom:24px}.card-header{padding:16px 20px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}.card-header h3{font-size:15px;font-weight:600}.card-body{padding:20px}
 table{width:100%;border-collapse:collapse}th{padding:10px 16px;text-align:left;font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:0.05em;border-bottom:1px solid #e5e7eb;border-right:1px solid #eee}th:last-child{border-right:none}td{padding:10px 16px;font-size:13px;border-bottom:1px solid #f0f0f0;border-right:1px solid #eee;vertical-align:middle}td:last-child{border-right:none}th:nth-child(odd){background:#f3f4f6}th:nth-child(even){background:#f8f9fa}td:nth-child(odd){background:#fafafa}td:nth-child(even){background:#fff}tr:hover td{background:#f5f3ff}
+tr.parent-row.expanded td{background:#f5f3ff;border-left:3px solid #4f46e5}tr.parent-row.expanded td:first-child{border-left:3px solid #4f46e5}tr.variant-row td{background:#fafbff}tr.variant-row td:first-child{border-left:3px solid #e5e7eb}
 .prod-name{font-weight:600;font-size:13px;color:#1a1a2e}.prod-sku{font-size:11px;color:#6b7280;margin-top:1px}.prod-cell{display:flex;align-items:center;gap:10px}.prod-thumb{width:40px;height:40px;border-radius:4px;background:#f0f1f3;display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0}.prod-thumb img{width:100%;height:100%;object-fit:cover}
 .btn{padding:8px 16px;border-radius:6px;border:none;font-size:13px;font-weight:500;cursor:pointer;transition:all 0.15s;display:inline-flex;align-items:center;justify-content:center;gap:6px;font-family:inherit}.btn-primary{background:#4f46e5;color:#fff}.btn-primary:hover{background:#4338ca}.btn-outline{background:#fff;border:1px solid #d1d5db;color:#374151}.btn-outline:hover{background:#f9fafb}.btn-sm{padding:6px 12px;font-size:12px}.btn-danger{background:#dc2626;color:#fff}.btn-danger:hover{background:#b91c1c}.btn-ghost{background:none;border:none;color:#4f46e5;font-weight:500;cursor:pointer;font-size:13px;font-family:inherit;padding:0}.btn-ghost:hover{text-decoration:underline}
 .fg{margin-bottom:14px}.fg label{display:block;font-size:12px;color:#374151;margin-bottom:4px;font-weight:600}.fg input,.fg textarea,.fg select{width:100%;padding:8px 12px;background:#fff;border:1px solid #d1d5db;border-radius:6px;color:#1a1a2e;font-size:13px;font-family:inherit;transition:border 0.15s}.fg input:focus,.fg textarea:focus,.fg select:focus{border-color:#4f46e5;outline:none;box-shadow:0 0 0 3px rgba(79,70,229,0.1)}.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
@@ -1655,7 +1656,7 @@ function renderImportTable(team){
       const hasVariants=g.variants.length>0;
       const chevron=hasVariants?'<button class="edit-btn" onclick="event.stopPropagation();toggleVariants(\\''+g.parentId+'\\',this)" style="transition:transform 0.15s;transform:rotate(180deg)">${ICONS.back}</button>':'';
       if(hasVariants){
-        html+='<tr style="cursor:pointer" onclick="toggleVariants(\\''+g.parentId+'\\',this.querySelector(\\'button\\'))"><td style="text-align:center">'+chevron+'</td><td><strong>'+esc(g.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+g.variantCount+' variants)</span></td><td></td><td style="color:#6b7280;font-size:12px">$'+(g.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600;color:#4f46e5">$'+(g.teamPrice||0).toFixed(2)+'</td><td style="font-weight:600">'+g.totalStock+'</td></tr>';
+        html+='<tr class="parent-row" style="cursor:pointer" onclick="toggleVariants(\\''+g.parentId+'\\',this.querySelector(\\'button\\'))"><td style="text-align:center">'+chevron+'</td><td><strong>'+esc(g.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+g.variantCount+' variants)</span></td><td></td><td style="color:#6b7280;font-size:12px">$'+(g.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600;color:#4f46e5">$'+(g.teamPrice||0).toFixed(2)+'</td><td style="font-weight:600">'+g.totalStock+'</td></tr>';
       }else{
         html+='<tr><td></td><td><strong>'+esc(g.name)+'</strong></td><td style="color:#6b7280;font-size:12px">'+esc(g.sku||'-')+'</td><td style="color:#6b7280;font-size:12px">$'+(g.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600;color:#4f46e5">$'+(g.teamPrice||0).toFixed(2)+'</td><td style="font-weight:600">'+g.totalStock+'</td></tr>';
       }
@@ -1679,10 +1680,14 @@ function toggleVariants(parentId,btn){
   if(!showing){
     // Close all other open groups first
     document.querySelectorAll('.variant-row').forEach(r=>{if(!r.classList.contains('vr-'+parentId))r.style.display='none'});
+    document.querySelectorAll('.parent-row').forEach(r=>{r.classList.remove('expanded')});
     document.querySelectorAll('.edit-btn').forEach(b=>{if(b!==btn)b.style.transform='rotate(180deg)'});
   }
   rows.forEach(r=>r.style.display=showing?'none':'table-row');
-  if(btn)btn.style.transform=showing?'rotate(180deg)':'rotate(270deg)';
+  if(btn){btn.style.transform=showing?'rotate(180deg)':'rotate(270deg)';
+    const parentRow=btn.closest('tr');
+    if(parentRow){parentRow.classList.toggle('expanded',!showing)}
+  }
 }
 function sortVariantLabel(a,b){
   const sizeOrder={XS:1,S:2,M:3,L:4,XL:5,'2XL':6,XXL:6,'3XL':7};
@@ -1756,7 +1761,7 @@ async function renderProducts(){
       const minTeamP=Math.min(...group.items.map(p=>p.teamPrice||999999));
       const minRetailP=Math.min(...group.items.map(p=>p.retailPrice||999999));
       const totalStockP=group.items.reduce((s,p)=>s+(p.stock||0),0);
-      html+='<tr style="cursor:pointer" onclick="toggleVariants(\\'pv-'+pid+'\\',this.querySelector(\\'button\\'))"><td style="text-align:center"><button class="edit-btn" onclick="event.stopPropagation();toggleVariants(\\'pv-'+pid+'\\',this)" style="transition:transform 0.15s;transform:rotate(180deg)">${ICONS.back}</button></td><td><strong>'+esc(group.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+group.items.length+' variants)</span></td><td></td><td style="font-weight:600;color:#4f46e5">$'+minTeamP.toFixed(2)+'</td><td style="color:#9ca3af">$'+minRetailP.toFixed(2)+'</td><td style="font-weight:600">'+totalStockP+'</td></tr>';
+      html+='<tr class="parent-row" style="cursor:pointer" onclick="toggleVariants(\\'pv-'+pid+'\\',this.querySelector(\\'button\\'))"><td style="text-align:center"><button class="edit-btn" onclick="event.stopPropagation();toggleVariants(\\'pv-'+pid+'\\',this)" style="transition:transform 0.15s;transform:rotate(180deg)">${ICONS.back}</button></td><td><strong>'+esc(group.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+group.items.length+' variants)</span></td><td></td><td style="font-weight:600;color:#4f46e5">$'+minTeamP.toFixed(2)+'</td><td style="color:#9ca3af">$'+minRetailP.toFixed(2)+'</td><td style="font-weight:600">'+totalStockP+'</td></tr>';
       const sortedItems=[...group.items].sort(sortVariantLabel);
       for(const p of sortedItems){
         html+='<tr class="variant-row pv-'+pid+'" style="display:none"><td></td><td style="padding-left:32px;color:#6b7280;font-size:12px">'+esc(p.variantLabel||p.variantName||'-')+'</td><td style="color:#6b7280;font-size:12px">'+esc(p.sku||'-')+'</td><td style="font-weight:600;color:#4f46e5;font-size:12px">$'+(p.teamPrice||0).toFixed(2)+'</td><td style="font-size:12px">$'+(p.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600">'+(p.stock||0)+'</td></tr>';
