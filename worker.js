@@ -1126,7 +1126,8 @@ function storePage() {
 .sc{max-width:1200px;margin:0 auto;padding:32px 24px}.st{font-size:20px;font-weight:700;margin-bottom:20px;color:#1a1a2e}
 .pg{display:grid;grid-template-columns:repeat(4,1fr);gap:20px}.pc{background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;cursor:pointer;transition:all 0.15s}.pc:hover{box-shadow:0 4px 12px rgba(0,0,0,0.08);transform:translateY(-2px)}.pc-img{height:200px;background:#f0f1f3;display:flex;align-items:center;justify-content:center}.pc-img img{width:100%;height:100%;object-fit:cover}.pc-info{padding:14px 16px}.pc-info h3{font-size:14px;font-weight:600;margin-bottom:4px;color:#1a1a2e;line-height:1.3}.pc-brand{font-size:11px;color:#6b7280;margin-bottom:6px}.pc-price-row{display:flex;align-items:center;justify-content:space-between;gap:8px}.pc-price{font-size:16px;font-weight:700;color:#1a1a2e}.pc-retail{font-size:12px;color:#9ca3af;text-decoration:line-through}.stock-badge{font-size:10px;font-weight:600;padding:2px 8px;border-radius:4px;white-space:nowrap}.stock-instock{background:#f0fdf4;color:#16a34a}.stock-order{background:#eff6ff;color:#2563eb}
 .pd{background:#fff;border-radius:8px;border:1px solid #e5e7eb;padding:32px;box-shadow:0 1px 3px rgba(0,0,0,0.08)}.pd-layout{display:grid;grid-template-columns:400px 1fr;gap:40px}.pd-image{height:400px;background:#f0f1f3;border-radius:8px;display:flex;align-items:center;justify-content:center;overflow:hidden}.pd-image img{width:100%;height:100%;object-fit:cover}.pd-info h2{font-size:22px;font-weight:700;margin-bottom:4px}.pd-brand{font-size:13px;color:#6b7280;margin-bottom:12px}.pd-info .price{font-size:24px;font-weight:700;color:#1a1a2e;margin-bottom:4px}.pd-info .retail-price{font-size:14px;color:#9ca3af;text-decoration:line-through;margin-bottom:16px}
-.vg{margin-bottom:16px}.vg label{display:block;font-size:12px;color:#6b7280;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px}.vg select{width:100%;padding:10px 12px;background:#fff;border:1px solid #d1d5db;border-radius:6px;color:#1a1a2e;font-size:14px;cursor:pointer;transition:border 0.15s}.vg select:focus{border-color:#4f46e5;outline:none;box-shadow:0 0 0 3px rgba(79,70,229,0.1)}
+.vg{margin-bottom:16px}.vg label{display:block;font-size:12px;color:#6b7280;margin-bottom:8px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px}.vg select{width:100%;padding:10px 12px;background:#fff;border:1px solid #d1d5db;border-radius:6px;color:#1a1a2e;font-size:14px;cursor:pointer;transition:border 0.15s}.vg select:focus{border-color:#4f46e5;outline:none;box-shadow:0 0 0 3px rgba(79,70,229,0.1)}
+.vo-group{display:flex;flex-wrap:wrap;gap:8px}.vo-btn{padding:8px 16px;border:1px solid #d1d5db;border-radius:6px;background:#fff;color:#1a1a2e;font-size:14px;font-weight:500;cursor:pointer;transition:all 0.15s;font-family:inherit}.vo-btn:hover{border-color:#4f46e5;background:#f5f3ff}.vo-btn.selected{border-color:#4f46e5;background:#4f46e5;color:#fff}
 .qty-row{display:flex;align-items:center;gap:12px;margin-bottom:20px}.qty-btn{width:36px;height:36px;border-radius:6px;border:1px solid #d1d5db;background:#fff;color:#1a1a2e;font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.15s}.qty-btn:hover{background:#f9fafb}
 .stock-indicator{font-size:13px;padding:4px 10px;border-radius:4px;display:inline-block;margin-bottom:16px;font-weight:500}.si-green{background:#f0fdf4;color:#16a34a}.si-blue{background:#eff6ff;color:#2563eb}
 .back-link{display:inline-flex;align-items:center;gap:4px;color:#6b7280;font-size:13px;margin-bottom:16px;cursor:pointer;font-weight:500;transition:color 0.15s}.back-link:hover{color:#1a1a2e}
@@ -1276,9 +1277,9 @@ async function showProduct(prodId){
     window._selectedVariant=null;
     if(labels.length>0){
       for(let i=0;i<labels.length;i++){
-        variantHtml+='<div class="vg"><label>'+esc(labels[i])+'</label><select data-attr-idx="'+i+'" onchange="onAttrChange()"><option value="">Select '+esc(labels[i])+'</option>';
-        for(const val of columns[i]){variantHtml+='<option value="'+esc(val)+'">'+esc(val)+'</option>';}
-        variantHtml+='</select></div>';
+        variantHtml+='<div class="vg"><label>'+esc(labels[i])+'</label><div class="vo-group" data-attr-idx="'+i+'">';
+        for(const val of columns[i]){variantHtml+='<button class="vo-btn" onclick="selectVariantOption(this,'+i+')" data-value="'+esc(val)+'">'+esc(val)+'</button>';}
+        variantHtml+='</div></div>';
       }
     } else {
       variantHtml='<div class="vg"><label>Options</label><select id="variant-select" onchange="onVariantChange()"><option value="">Select an option</option>'+p.variants.map(v=>'<option value="'+esc(v.id)+'" data-stock="'+(v.stock||0)+'" data-team="'+(v.teamPrice||0)+'" data-retail="'+(v.retailPrice||0)+'" data-name="'+esc(v.name)+'">'+esc(v.name)+(v.stock>0?' (In Stock)':' (Available to Order)')+'</option>').join('')+'</select></div>';
@@ -1307,22 +1308,43 @@ function parseVariantAttributes(variants){
     if(vals.some(v=>/^(Black|White|Navy|Red|Blue|Grey|Charcoal|Green)$/i.test(v)))return'Color';
     return'Option '+(idx+1);
   });
+  // Sort each column logically
+  const sizeOrder={XS:1,S:2,M:3,L:4,XL:5,'2XL':6,XXL:6,'3XL':7};
+  const handOrder={Left:1,LFT:1,Right:2,RHT:2};
+  for(let i=0;i<columns.length;i++){
+    if(labels[i]==='Size')columns[i].sort((a,b)=>(sizeOrder[a]||50+parseFloat(a)||99)-(sizeOrder[b]||50+parseFloat(b)||99));
+    else if(labels[i]==='Flex')columns[i].sort((a,b)=>parseInt(a)-parseInt(b));
+    else if(labels[i]==='Hand')columns[i].sort((a,b)=>(handOrder[a]||9)-(handOrder[b]||9));
+    else if(labels[i]==='Curve')columns[i].sort();
+    else if(labels[i]==='Color')columns[i].sort();
+  }
   return{labels,columns};
 }
 
+function selectVariantOption(btn,attrIdx){
+  // Toggle selection within this group
+  const group=btn.closest('.vo-group');
+  group.querySelectorAll('.vo-btn').forEach(b=>b.classList.remove('selected'));
+  btn.classList.add('selected');
+  onAttrChange();
+}
 function onAttrChange(){
-  const selects=document.querySelectorAll('[data-attr-idx]');
+  const groups=document.querySelectorAll('.vo-group[data-attr-idx]');
   const selected={};
   let allSelected=true;
-  selects.forEach(s=>{if(s.value)selected[s.dataset.attrIdx]=s.value;else allSelected=false;});
-  const btn=document.getElementById('btn-add');
-  if(!allSelected){btn.disabled=true;return;}
+  groups.forEach(g=>{
+    const sel=g.querySelector('.vo-btn.selected');
+    if(sel)selected[g.dataset.attrIdx]=sel.dataset.value;
+    else allSelected=false;
+  });
+  const addBtn=document.getElementById('btn-add');
+  if(!allSelected){addBtn.disabled=true;return;}
   const p=window._currentProduct;
   const match=p.variants.find(v=>{
     const pts=(v.name||'').split(' / ').map(s=>s.trim());
     return Object.entries(selected).every(([idx,val])=>pts[parseInt(idx)]===val);
   });
-  btn.disabled=!match;
+  addBtn.disabled=!match;
   if(match){
     document.getElementById('pd-price').textContent='$'+(match.teamPrice||0).toFixed(2);
     const retailEl=document.getElementById('pd-retail');
