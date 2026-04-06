@@ -1167,7 +1167,11 @@ let storeSearchQuery='';let _searchDebounce=null;
 })();
 
 const pinInputs=document.querySelectorAll('.pin-dots input');
-pinInputs.forEach((inp,i)=>{inp.addEventListener('input',()=>{if(inp.value&&i<pinInputs.length-1)pinInputs[i+1].focus();if(i===pinInputs.length-1&&inp.value)checkPin()});inp.addEventListener('keydown',e=>{if(e.key==='Backspace'&&!inp.value&&i>0)pinInputs[i-1].focus()})});
+pinInputs.forEach((inp,i)=>{
+  inp.addEventListener('input',()=>{inp.value=inp.value.replace(/[^0-9]/g,'').slice(0,1);if(inp.value){if(i<pinInputs.length-1)pinInputs[i+1].focus();else checkPin()}});
+  inp.addEventListener('keydown',e=>{if(e.key==='Backspace'){if(!inp.value&&i>0){pinInputs[i-1].value='';pinInputs[i-1].focus()}else{inp.value=''}}});
+  inp.addEventListener('focus',()=>inp.select());
+});
 
 async function checkPin(){
   const pin=Array.from(pinInputs).map(i=>i.value).join('');
@@ -1501,7 +1505,11 @@ const IC=${JSON.stringify(ICONS)};
 
 // PIN
 const pinInputs=document.querySelectorAll('.pin-dots input');
-pinInputs.forEach((inp,i)=>{inp.addEventListener('input',()=>{if(inp.value&&i<pinInputs.length-1)pinInputs[i+1].focus();if(i===pinInputs.length-1&&inp.value)checkAdminPin()});inp.addEventListener('keydown',e=>{if(e.key==='Backspace'&&!inp.value&&i>0)pinInputs[i-1].focus()})});
+pinInputs.forEach((inp,i)=>{
+  inp.addEventListener('input',()=>{inp.value=inp.value.replace(/[^0-9]/g,'').slice(0,1);if(inp.value){if(i<pinInputs.length-1)pinInputs[i+1].focus();else checkAdminPin()}});
+  inp.addEventListener('keydown',e=>{if(e.key==='Backspace'){if(!inp.value&&i>0){pinInputs[i-1].value='';pinInputs[i-1].focus()}else{inp.value=''}}});
+  inp.addEventListener('focus',()=>inp.select());
+});
 async function checkAdminPin(){const pin=Array.from(pinInputs).map(i=>i.value).join('');if(pin.length<4)return;try{const r=await fetch('/api/verify-admin-pin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin})});if(r.ok){sessionStorage.setItem('admin_pin',pin);document.getElementById('admin-pin-screen').style.display='none';document.getElementById('admin-app').style.display='';loadAdmin()}else{document.getElementById('pin-error').textContent='Invalid PIN';pinInputs.forEach(i=>i.value='');pinInputs[0].focus()}}catch(e){document.getElementById('pin-error').textContent='Connection error'}}
 if(sessionStorage.getItem('admin_pin')){document.getElementById('admin-pin-screen').style.display='none';document.getElementById('admin-app').style.display='';loadAdmin()}
 
