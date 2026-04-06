@@ -1226,7 +1226,8 @@ function showHome(){
   else if(filtered.length===0){html+='<div class="loading">No products found for "'+esc(storeSearchQuery)+'"</div>'}
   else{html+='<div class="pg">'+filtered.map(productCard).join('')+'</div>'}
   m.innerHTML=html;
-  const si=document.getElementById('store-search');if(si){si.focus();si.setSelectionRange(si.value.length,si.value.length);}
+  if(window._scrollPos&&currentView==='home'){setTimeout(()=>{window.scrollTo(0,window._scrollPos);window._scrollPos=null},50)}
+  const si=document.getElementById('store-search');if(si&&storeSearchQuery){si.focus();si.setSelectionRange(si.value.length,si.value.length)}
 }
 
 function levenshtein(a,b){
@@ -1262,6 +1263,7 @@ function productCard(p){
 }
 
 async function showProduct(prodId){
+  window._scrollPos=window.scrollY;
   currentView='product';
   document.getElementById('main-content').innerHTML='<div class="loading">Loading...</div>';
   const r=await fetch('/api/product/'+prodId+'?priceBookId='+encodeURIComponent(teamContext.priceBookId));
