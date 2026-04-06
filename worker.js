@@ -76,6 +76,19 @@ function lsApi(env) {
   const prefix = env.LIGHTSPEED_DOMAIN_PREFIX || 'icelabproshop';
   return `https://${prefix}.retail.lightspeed.app/api/2.0`;
 }
+function lsApiLegacy(env) {
+  const prefix = env.LIGHTSPEED_DOMAIN_PREFIX || 'icelabproshop';
+  return `https://${prefix}.retail.lightspeed.app/api`;
+}
+async function lsFetchLegacy(env, endpoint, options = {}) {
+  const url = `${lsApiLegacy(env)}/${endpoint}`;
+  const resp = await fetch(url, { headers: lsHeaders(env), ...options });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Lightspeed API error ${resp.status}: ${text}`);
+  }
+  return resp.json();
+}
 function lsHeaders(env) {
   return { 'Authorization': `Bearer ${env.LIGHTSPEED_API_TOKEN}`, 'Content-Type': 'application/json', 'Accept': 'application/json' };
 }
@@ -678,17 +691,19 @@ async function apiTestOrder(request, env) {
     register_id: saleConfig.registerId,
     user_id: saleConfig.userId,
     customer_id: customerId,
-    status: 'on_account',
+    status: 'LAYBY',
     note: `TEST ORDER - ${team.name} | Test from Team Store Admin`,
     register_sale_products: [{
       product_id: testProduct.lightspeedProductId,
       quantity: 1,
       price: testProduct.teamPrice,
-      tax: 0
+      tax: 0,
+      tax_id: '06f24f8b-21fd-11ef-f4ca-66ee517740dd',
+      status: 'CONFIRMED'
     }]
   };
   if (saleConfig.paymentTypeId) {
-    salePayload.register_sale_payments = [{ payment_type_id: saleConfig.paymentTypeId, amount: testProduct.teamPrice }];
+    salePayload.register_sale_payments = [{ retailer_payment_type_id: saleConfig.paymentTypeId, amount: testProduct.teamPrice }];
   }
 
   steps.push({ step: 6, action: 'Build sale payload', status: 'ready', detail: {
@@ -700,7 +715,7 @@ async function apiTestOrder(request, env) {
   // STEP 7: Create sale (only if body.confirm === true)
   if (body.confirm) {
     try {
-      const saleResp = await lsFetch(env, 'register_sales', { method: 'POST', body: JSON.stringify(salePayload) });
+      const saleResp = await lsFetchLegacy(env, 'register_sales', { method: 'POST', body: JSON.stringify(salePayload) });
       const sale = saleResp.register_sale || saleResp.data || saleResp;
       saleId = sale.id;
       steps.push({ step: 7, action: 'Create sale in Lightspeed', status: 'created', detail: {
@@ -735,22 +750,24 @@ async function createLightspeedSale(env, order) {
     product_id: item.lightspeedProductId || item.lightspeedId || item.productId,
     quantity: item.qty,
     price: item.teamPrice || item.price,
-    tax: 0
+    tax: 0,
+    tax_id: '06f24f8b-21fd-11ef-f4ca-66ee517740dd',
+    status: 'CONFIRMED'
   }));
 
   const salePayload = {
     register_id: saleConfig.registerId,
     user_id: saleConfig.userId,
-    status: 'on_account',
+    status: 'LAYBY',
     note: `TEAM ORDER - ${order.teamName || 'Team Store'} | Paid via Stripe | Order #${orderNum}`,
     register_sale_products: saleProducts
   };
   if (customerId) salePayload.customer_id = customerId;
   if (saleConfig.paymentTypeId) {
-    salePayload.register_sale_payments = [{ payment_type_id: saleConfig.paymentTypeId, amount: order.total }];
+    salePayload.register_sale_payments = [{ retailer_payment_type_id: saleConfig.paymentTypeId, amount: order.total }];
   }
 
-  const saleResp = await lsFetch(env, 'register_sales', { method: 'POST', body: JSON.stringify(salePayload) });
+  const saleResp = await lsFetchLegacy(env, 'register_sales', { method: 'POST', body: JSON.stringify(salePayload) });
   return saleResp.register_sale?.id || saleResp.id || 'unknown';
 }
 
