@@ -1631,7 +1631,11 @@ function renderImportTable(team){
     for(const g of groups){
       const hasVariants=g.variants.length>0;
       const chevron=hasVariants?'<button class="edit-btn" onclick="event.stopPropagation();toggleVariants(\\''+g.parentId+'\\',this)" style="transition:transform 0.15s;transform:rotate(-90deg)">${ICONS.back}</button>':'';
-      html+='<tr style="cursor:'+(hasVariants?'pointer':'default')+'" '+(hasVariants?'onclick="toggleVariants(\\''+g.parentId+'\\',this.querySelector(\\'button\\'))"':'')+'><td style="text-align:center">'+chevron+'</td><td><strong>'+esc(g.name)+'</strong>'+(hasVariants?' <span style="color:#6b7280;font-size:11px">('+g.variantCount+' variants)</span>':'')+'</td><td style="color:#6b7280;font-size:12px">'+esc(g.sku||'-')+'</td><td style="color:#6b7280;font-size:12px">$'+(g.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600;color:#4f46e5">$'+(g.teamPrice||0).toFixed(2)+'</td><td>'+g.totalStock+'</td></tr>';
+      if(hasVariants){
+        html+='<tr style="cursor:pointer" onclick="toggleVariants(\\''+g.parentId+'\\',this.querySelector(\\'button\\'))"><td style="text-align:center">'+chevron+'</td><td colspan="5"><strong>'+esc(g.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+g.variantCount+' variants)</span></td></tr>';
+      }else{
+        html+='<tr><td></td><td><strong>'+esc(g.name)+'</strong></td><td style="color:#6b7280;font-size:12px">'+esc(g.sku||'-')+'</td><td style="color:#6b7280;font-size:12px">$'+(g.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600;color:#4f46e5">$'+(g.teamPrice||0).toFixed(2)+'</td><td>'+g.totalStock+'</td></tr>';
+      }
       // Variant rows - hidden by default
       if(hasVariants){
         for(const v of g.variants){
@@ -1704,8 +1708,7 @@ async function renderProducts(){
       const totalStock=group.items.reduce((s,p)=>s+(p.stock||0),0);
       const minTeam=Math.min(...group.items.map(p=>p.teamPrice||999999));
       const minRetail=Math.min(...group.items.map(p=>p.retailPrice||999999));
-      const firstSku=group.items[0]?.sku||'';
-      html+='<tr style="cursor:pointer" onclick="toggleVariants(\\'pv-'+pid+'\\',this.querySelector(\\'button\\'))"><td style="text-align:center"><button class="edit-btn" onclick="event.stopPropagation();toggleVariants(\\'pv-'+pid+'\\',this)" style="transition:transform 0.15s;transform:rotate(-90deg)">${ICONS.back}</button></td><td><strong>'+esc(group.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+group.items.length+' variants)</span></td><td style="color:#6b7280;font-size:12px">'+esc(firstSku||'-')+'</td><td style="font-weight:600;color:#4f46e5">$'+minTeam.toFixed(2)+'</td><td style="color:#9ca3af">$'+minRetail.toFixed(2)+'</td><td>'+totalStock+'</td></tr>';
+      html+='<tr style="cursor:pointer" onclick="toggleVariants(\\'pv-'+pid+'\\',this.querySelector(\\'button\\'))"><td style="text-align:center"><button class="edit-btn" onclick="event.stopPropagation();toggleVariants(\\'pv-'+pid+'\\',this)" style="transition:transform 0.15s;transform:rotate(-90deg)">${ICONS.back}</button></td><td colspan="5"><strong>'+esc(group.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+group.items.length+' variants)</span></td></tr>';
       for(const p of group.items){
         html+='<tr class="variant-row pv-'+pid+'" style="display:none"><td></td><td style="padding-left:32px;color:#6b7280;font-size:12px">'+esc(p.variantLabel||p.variantName||'-')+'</td><td style="color:#6b7280;font-size:12px">'+esc(p.sku||'-')+'</td><td style="font-weight:600;color:#4f46e5;font-size:12px">$'+(p.teamPrice||0).toFixed(2)+'</td><td style="color:#9ca3af;font-size:12px">$'+(p.retailPrice||0).toFixed(2)+'</td><td>'+(p.stock>0?'<span class="badge-status badge-success">'+p.stock+'</span>':'<span style="color:#9ca3af">0</span>')+'</td></tr>';
       }
