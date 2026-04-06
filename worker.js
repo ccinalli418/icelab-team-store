@@ -1651,7 +1651,7 @@ function toggleVariants(parentId,btn){
   const rows=document.querySelectorAll('.vr-'+CSS.escape(parentId));
   const showing=rows[0]&&rows[0].style.display!=='none';
   rows.forEach(r=>r.style.display=showing?'none':'table-row');
-  if(btn)btn.style.transform=showing?'rotate(180deg)':'rotate(90deg)';
+  if(btn)btn.style.transform=showing?'rotate(180deg)':'rotate(270deg)';
 }
 async function syncTeam(priceBookId,teamName){
   const btn=document.getElementById('sync-btn');
