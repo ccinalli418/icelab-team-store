@@ -507,16 +507,149 @@ async function verifyStripeSignature(payload, sigHeader, secret) {
 // ============================================================
 // LIGHTSPEED SALE CREATION
 // ============================================================
+// LIGHTSPEED SALE HELPERS — shared by test order + real checkout
+// ============================================================
+
+// Find or create customer in Lightspeed
+// Search by email (exact match, skip null/empty emails), then by phone, then create
+async function lsFindOrCreateCustomer(env, customer, steps) {
+  const log = (step, action, status, detail) => { if (steps) steps.push({ step, action, status, detail }); };
+
+  let customerId = null;
+
+  // Step 1a: Search by email
+  if (customer.email) {
+    try {
+      const custSearch = await lsFetch(env, `customers?email=${encodeURIComponent(customer.email)}`);
+      const customers = (custSearch.customers || custSearch.data || [])
+        .filter(c => c.email && c.email.trim() !== '' && c.email.toLowerCase() === customer.email.toLowerCase());
+      if (customers.length > 0) {
+        customerId = customers[0].id;
+        log(1, 'Search customer by email', 'found', { id: customerId, name: `${customers[0].first_name} ${customers[0].last_name}`, email: customers[0].email });
+        return customerId;
+      } else {
+        log(1, 'Search customer by email', 'not_found', { email: customer.email, note: 'No customer with matching non-null email' });
+      }
+    } catch (e) {
+      log(1, 'Search customer by email', 'error', e.message);
+    }
+  }
+
+  // Step 1b: Search by phone
+  if (!customerId && customer.phone) {
+    try {
+      const phoneCleaned = customer.phone.replace(/[^0-9]/g, '');
+      const custSearch = await lsFetch(env, `customers?phone=${encodeURIComponent(customer.phone)}`);
+      const customers = (custSearch.customers || custSearch.data || [])
+        .filter(c => c.phone && c.phone.replace(/[^0-9]/g, '').includes(phoneCleaned.slice(-7)));
+      if (customers.length > 0) {
+        customerId = customers[0].id;
+        log('1b', 'Search customer by phone', 'found', { id: customerId, name: `${customers[0].first_name} ${customers[0].last_name}`, phone: customers[0].phone });
+        return customerId;
+      } else {
+        log('1b', 'Search customer by phone', 'not_found', { phone: customer.phone });
+      }
+    } catch (e) {
+      log('1b', 'Search customer by phone', 'error', e.message);
+    }
+  }
+
+  // Step 2: Create customer
+  if (!customerId) {
+    try {
+      const nameParts = (customer.name || '').split(' ');
+      const payload = {
+        first_name: nameParts[0] || '',
+        last_name: nameParts.slice(1).join(' ') || '',
+        email: customer.email || '',
+        phone: customer.phone || ''
+      };
+      log(2, 'Create customer', 'sending', { payload });
+      const newCust = await lsFetch(env, 'customers', { method: 'POST', body: JSON.stringify(payload) });
+      const custData = newCust.data || newCust.customer || newCust;
+      customerId = custData.id;
+      log(2, 'Create customer', 'created', {
+        id: customerId,
+        response: { id: custData.id, first_name: custData.first_name, last_name: custData.last_name, email: custData.email, phone: custData.phone }
+      });
+    } catch (e) {
+      log(2, 'Create customer', 'error', e.message);
+    }
+  }
+
+  return customerId;
+}
+
+// Get cached Lightspeed config (register ID, user ID, payment type ID)
+// Caches in KV for 24 hours to avoid fetching every sale
+async function getLightspeedSaleConfig(env, steps) {
+  const log = (step, action, status, detail) => { if (steps) steps.push({ step, action, status, detail }); };
+
+  // Check KV cache
+  const cached = await env.STORE_DATA.get('ls_sale_config', 'json');
+  if (cached && cached.cachedAt && (Date.now() - new Date(cached.cachedAt).getTime() < 24 * 60 * 60 * 1000)) {
+    log(3, 'Load cached sale config', 'cached', { registerId: cached.registerId, registerName: cached.registerName, userId: cached.userId, userName: cached.userName, paymentTypeId: cached.paymentTypeId, paymentTypeName: cached.paymentTypeName });
+    return cached;
+  }
+
+  const config = { registerId: null, registerName: null, userId: null, userName: null, paymentTypeId: null, paymentTypeName: null };
+
+  // Fetch registers — find "Main Register"
+  try {
+    const registersData = await lsFetch(env, 'registers');
+    const registers = registersData.registers || registersData.data || [];
+    log(3, 'Fetch registers', 'ok', registers.map(r => ({ id: r.id, name: r.name })));
+    const mainReg = registers.find(r => r.name && r.name.toLowerCase().includes('main'));
+    const selected = mainReg || registers[0];
+    if (selected) {
+      config.registerId = selected.id;
+      config.registerName = selected.name;
+    }
+  } catch (e) {
+    log(3, 'Fetch registers', 'error', e.message);
+  }
+
+  // Fetch users — first user
+  try {
+    const usersData = await lsFetch(env, 'users');
+    const users = usersData.users || usersData.data || [];
+    log(4, 'Fetch users', 'ok', users.map(u => ({ id: u.id, name: u.display_name || u.name || u.email })));
+    if (users.length) {
+      config.userId = users[0].id;
+      config.userName = users[0].display_name || users[0].name || users[0].email;
+    }
+  } catch (e) {
+    log(4, 'Fetch users', 'error', e.message);
+  }
+
+  // Fetch payment types — find "Lightspeed Payments"
+  try {
+    const ptData = await lsFetch(env, 'payment_types');
+    const paymentTypes = ptData.payment_types || ptData.data || [];
+    log(5, 'Fetch payment types', 'ok', paymentTypes.map(pt => ({ id: pt.id, name: pt.name })));
+    const lsPay = paymentTypes.find(pt => pt.name === 'Lightspeed Payments');
+    const selected = lsPay || paymentTypes[0];
+    if (selected) {
+      config.paymentTypeId = selected.id;
+      config.paymentTypeName = selected.name;
+    }
+  } catch (e) {
+    log(5, 'Fetch payment types', 'error', e.message);
+  }
+
+  // Cache for 24 hours
+  config.cachedAt = new Date().toISOString();
+  await env.STORE_DATA.put('ls_sale_config', JSON.stringify(config));
+
+  return config;
+}
+
 // ============================================================
 // TEST ORDER — simulates full Lightspeed sale creation step by step
 // ============================================================
 async function apiTestOrder(request, env) {
   const body = await request.json();
   const steps = [];
-  let customerId = null;
-  let registerId = null;
-  let userId = null;
-  let paymentTypeId = null;
   let saleId = null;
 
   const testCustomer = {
@@ -534,70 +667,16 @@ async function apiTestOrder(request, env) {
   if (!products.length) return json({ error: 'No products in price book. Sync first.' }, 400);
   const testProduct = products[0];
 
-  // STEP 1: Search for existing customer
-  try {
-    const custSearch = await lsFetch(env, `customers?email=${encodeURIComponent(testCustomer.email)}`);
-    const customers = custSearch.customers || custSearch.data || [];
-    if (customers.length > 0) {
-      customerId = customers[0].id;
-      steps.push({ step: 1, action: 'Search customer by email', status: 'found', detail: { id: customerId, name: `${customers[0].first_name} ${customers[0].last_name}`, email: customers[0].email } });
-    } else {
-      steps.push({ step: 1, action: 'Search customer by email', status: 'not_found', detail: { email: testCustomer.email } });
-    }
-  } catch (e) {
-    steps.push({ step: 1, action: 'Search customer by email', status: 'error', detail: e.message });
-  }
+  // Steps 1-2: Find or create customer
+  const customerId = await lsFindOrCreateCustomer(env, testCustomer, steps);
 
-  // STEP 2: Create customer if not found
-  if (!customerId) {
-    try {
-      const nameParts = testCustomer.name.split(' ');
-      const payload = { first_name: nameParts[0] || '', last_name: nameParts.slice(1).join(' ') || '', email: testCustomer.email, phone: testCustomer.phone };
-      steps.push({ step: 2, action: 'Create customer', status: 'sending', detail: { payload } });
-      const newCust = await lsFetch(env, 'customers', { method: 'POST', body: JSON.stringify(payload) });
-      const custData = newCust.data || newCust.customer || newCust;
-      customerId = custData.id;
-      steps.push({ step: 2, action: 'Create customer', status: 'created', detail: { id: customerId, response: { id: custData.id, first_name: custData.first_name, last_name: custData.last_name, email: custData.email, phone: custData.phone } } });
-    } catch (e) {
-      steps.push({ step: 2, action: 'Create customer', status: 'error', detail: e.message });
-    }
-  }
+  // Steps 3-5: Get register, user, payment type (cached)
+  const saleConfig = await getLightspeedSaleConfig(env, steps);
 
-  // STEP 3: Get register
-  try {
-    const registersData = await lsFetch(env, 'registers');
-    const registers = registersData.registers || registersData.data || [];
-    steps.push({ step: 3, action: 'Fetch registers', status: 'ok', detail: registers.map(r => ({ id: r.id, name: r.name })) });
-    if (registers.length) registerId = registers[0].id;
-  } catch (e) {
-    steps.push({ step: 3, action: 'Fetch registers', status: 'error', detail: e.message });
-  }
-
-  // STEP 4: Get user
-  try {
-    const usersData = await lsFetch(env, 'users');
-    const users = usersData.users || usersData.data || [];
-    steps.push({ step: 4, action: 'Fetch users', status: 'ok', detail: users.map(u => ({ id: u.id, name: u.display_name || u.name || u.email })) });
-    if (users.length) userId = users[0].id;
-  } catch (e) {
-    steps.push({ step: 4, action: 'Fetch users', status: 'error', detail: e.message });
-  }
-
-  // STEP 5: Get payment types
-  try {
-    const ptData = await lsFetch(env, 'payment_types');
-    const paymentTypes = ptData.payment_types || ptData.data || [];
-    steps.push({ step: 5, action: 'Fetch payment types', status: 'ok', detail: paymentTypes.map(pt => ({ id: pt.id, name: pt.name })) });
-    const onAccount = paymentTypes.find(pt => pt.name?.toLowerCase().includes('account') || pt.name?.toLowerCase().includes('layby'));
-    paymentTypeId = onAccount?.id || paymentTypes[0]?.id;
-  } catch (e) {
-    steps.push({ step: 5, action: 'Fetch payment types', status: 'error', detail: e.message });
-  }
-
-  // STEP 6: Build sale payload (show it but don't send unless confirmed)
+  // STEP 6: Build sale payload
   const salePayload = {
-    register_id: registerId,
-    user_id: userId,
+    register_id: saleConfig.registerId,
+    user_id: saleConfig.userId,
     customer_id: customerId,
     status: 'on_account',
     note: `TEST ORDER - ${team.name} | Test from Team Store Admin`,
@@ -608,12 +687,13 @@ async function apiTestOrder(request, env) {
       tax: 0
     }]
   };
-  if (paymentTypeId) {
-    salePayload.register_sale_payments = [{ payment_type_id: paymentTypeId, amount: testProduct.teamPrice }];
+  if (saleConfig.paymentTypeId) {
+    salePayload.register_sale_payments = [{ payment_type_id: saleConfig.paymentTypeId, amount: testProduct.teamPrice }];
   }
 
   steps.push({ step: 6, action: 'Build sale payload', status: 'ready', detail: {
     payload: salePayload,
+    resolved: { register: saleConfig.registerName, user: saleConfig.userName, paymentType: saleConfig.paymentTypeName },
     productUsed: { name: testProduct.variantName || testProduct.name, sku: testProduct.sku, teamPrice: testProduct.teamPrice }
   }});
 
@@ -640,44 +720,15 @@ async function apiTestOrder(request, env) {
   return json({ steps, customer: testCustomer, teamName: team.name, saleId });
 }
 
+// ============================================================
+// LIGHTSPEED SALE CREATION — used by Stripe webhook
+// ============================================================
 async function createLightspeedSale(env, order) {
-  const registersData = await lsFetch(env, 'registers');
-  const registers = registersData.registers || registersData.data || [];
-  if (!registers.length) throw new Error('No registers found');
-  const registerId = registers[0].id;
+  const saleConfig = await getLightspeedSaleConfig(env, null);
+  if (!saleConfig.registerId) throw new Error('No register configured');
+  if (!saleConfig.userId) throw new Error('No user configured');
 
-  const usersData = await lsFetch(env, 'users');
-  const users = usersData.users || usersData.data || [];
-  if (!users.length) throw new Error('No users found');
-  const userId = users[0].id;
-
-  let customerId = null;
-  if (order.customer.email) {
-    try {
-      const custSearch = await lsFetch(env, `customers?email=${encodeURIComponent(order.customer.email)}`);
-      const customers = custSearch.customers || custSearch.data || [];
-      if (customers.length > 0) customerId = customers[0].id;
-    } catch (e) { console.error('Customer search failed:', e.message); }
-  }
-
-  if (!customerId && order.customer.email) {
-    try {
-      const nameParts = (order.customer.name || '').split(' ');
-      const newCust = await lsFetch(env, 'customers', {
-        method: 'POST',
-        body: JSON.stringify({ first_name: nameParts[0] || '', last_name: nameParts.slice(1).join(' ') || '', email: order.customer.email, phone: order.customer.phone || '' })
-      });
-      customerId = newCust.customer?.id || newCust.id;
-    } catch (e) { console.error('Customer creation failed:', e.message); }
-  }
-
-  let paymentTypeId = null;
-  try {
-    const ptData = await lsFetch(env, 'payment_types');
-    const paymentTypes = ptData.payment_types || ptData.data || [];
-    const onAccount = paymentTypes.find(pt => pt.name?.toLowerCase().includes('account') || pt.name?.toLowerCase().includes('layby'));
-    paymentTypeId = onAccount?.id || paymentTypes[0]?.id;
-  } catch (e) { console.error('Payment types fetch failed:', e.message); }
+  const customerId = await lsFindOrCreateCustomer(env, order.customer, null);
 
   const orderNum = order.id.slice(-6).toUpperCase();
   const saleProducts = order.items.map(item => ({
@@ -688,15 +739,15 @@ async function createLightspeedSale(env, order) {
   }));
 
   const salePayload = {
-    register_id: registerId,
-    user_id: userId,
+    register_id: saleConfig.registerId,
+    user_id: saleConfig.userId,
     status: 'on_account',
     note: `TEAM ORDER - ${order.teamName || 'Team Store'} | Paid via Stripe | Order #${orderNum}`,
     register_sale_products: saleProducts
   };
   if (customerId) salePayload.customer_id = customerId;
-  if (paymentTypeId) {
-    salePayload.register_sale_payments = [{ payment_type_id: paymentTypeId, amount: order.total }];
+  if (saleConfig.paymentTypeId) {
+    salePayload.register_sale_payments = [{ payment_type_id: saleConfig.paymentTypeId, amount: order.total }];
   }
 
   const saleResp = await lsFetch(env, 'register_sales', { method: 'POST', body: JSON.stringify(salePayload) });
