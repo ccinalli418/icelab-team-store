@@ -686,12 +686,14 @@ async function apiTestOrder(request, env) {
   // Steps 3-5: Get register, user, payment type (cached)
   const saleConfig = await getLightspeedSaleConfig(env, steps);
 
-  // STEP 6: Build sale payload
+  // STEP 6: Build sale payload — pickup fulfillment
   const salePayload = {
     register_id: saleConfig.registerId,
     user_id: saleConfig.userId,
     customer_id: customerId,
-    status: 'CLOSED',
+    status: 'AWAITING_PICKUP',
+    state: 'pending',
+    register_sale_attributes: ['pickup'],
     note: `TEST ORDER - ${team.name} | Test from Team Store Admin`,
     register_sale_products: [{
       product_id: testProduct.lightspeedProductId,
@@ -699,7 +701,8 @@ async function apiTestOrder(request, env) {
       price: testProduct.teamPrice,
       tax: 0,
       tax_id: '06f24f8b-21fd-11ef-f4ca-66ee517740dd',
-      status: 'CONFIRMED'
+      status: 'CONFIRMED',
+      fulfillment_type: 'PICKUP'
     }]
   };
   if (saleConfig.paymentTypeId) {
@@ -752,13 +755,16 @@ async function createLightspeedSale(env, order) {
     price: item.teamPrice || item.price,
     tax: 0,
     tax_id: '06f24f8b-21fd-11ef-f4ca-66ee517740dd',
-    status: 'CONFIRMED'
+    status: 'CONFIRMED',
+    fulfillment_type: 'PICKUP'
   }));
 
   const salePayload = {
     register_id: saleConfig.registerId,
     user_id: saleConfig.userId,
-    status: 'CLOSED',
+    status: 'AWAITING_PICKUP',
+    state: 'pending',
+    register_sale_attributes: ['pickup'],
     note: `TEAM ORDER - ${order.teamName || 'Team Store'} | Paid via Stripe | Order #${orderNum}`,
     register_sale_products: saleProducts
   };
