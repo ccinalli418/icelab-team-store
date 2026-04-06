@@ -1488,8 +1488,7 @@ table{width:100%;border-collapse:collapse}th{padding:10px 16px;text-align:left;f
 <div class="sidebar-overlay" id="sidebar-overlay" onclick="toggleSidebar()"></div>
 <div class="admin-layout">
 <aside class="sidebar" id="sidebar"><div class="sidebar-brand">Ice Lab Team Store <span class="badge">Admin</span></div><nav class="sidebar-nav">
-<button class="active" onclick="showTab('import')" data-tab="import">${ICONS.importIcon} Import Products</button>
-<button onclick="showTab('products')" data-tab="products">${ICONS.products} Products</button>
+<button class="active" onclick="showTab('products')" data-tab="products">${ICONS.products} Products</button>
 <button onclick="showTab('orders')" data-tab="orders">${ICONS.orders} Recent Orders</button>
 <button onclick="showTab('settings')" data-tab="settings">${ICONS.settings} Settings</button>
 </nav><div class="sidebar-footer"><a href="/">${ICONS.store} View Store</a></div></aside>
@@ -1500,7 +1499,7 @@ table{width:100%;border-collapse:collapse}th{padding:10px 16px;text-align:left;f
 <div class="toast" id="toast"></div>
 <script>
 let adminTeams=[],importProducts=[],allProducts=[],adminOrders=[],adminConfig={};
-let currentTab='import',searchQuery='',selectedTeamIdx=0;
+let currentTab='products',searchQuery='',selectedTeamIdx=0;
 const IC=${JSON.stringify(ICONS)};
 
 // PIN
@@ -1529,8 +1528,7 @@ function showTab(tab){
   document.querySelectorAll('.sidebar-nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
   document.getElementById('sidebar').classList.remove('open');
   document.getElementById('sidebar-overlay').classList.remove('open');
-  if(tab==='import')renderImport();
-  else if(tab==='products')renderProducts();
+  if(tab==='products')renderImport();
   else if(tab==='orders')renderOrders();
   else if(tab==='settings')renderSettings();
 }
@@ -1539,10 +1537,10 @@ function setTopbar(title,actions){document.getElementById('topbar-title').textCo
 
 // ============ IMPORT PRODUCTS ============
 async function renderImport(){
-  setTopbar('Import Products');
+  setTopbar('Products');
   const c=document.getElementById('admin-content');
   if(!adminTeams.length){
-    c.innerHTML='<div class="settings-card"><h3>No Teams Configured</h3><p style="color:#6b7280;margin-bottom:16px">Add teams in the Settings tab first, then come back here to sync their price book products.</p><button class="btn btn-primary" onclick="showTab(\\'settings\\')">Go to Settings</button></div>';
+    c.innerHTML='<div class="settings-card"><h3>No Teams Configured</h3><p style="color:#6b7280;margin-bottom:16px">Add teams in the Settings tab first, then come back here to sync their price book products.</p><button class="btn btn-primary" onclick="showTab(\\\'settings\\\')">Go to Settings</button></div>';
     return;
   }
 
@@ -1630,7 +1628,7 @@ function renderImportTable(team){
     html+='<div style="overflow-x:auto"><table><thead><tr><th style="width:30px"></th><th>Product</th><th>SKU</th><th>Retail</th><th>Team Price</th><th>Stock</th></tr></thead><tbody>';
     for(const g of groups){
       const hasVariants=g.variants.length>0;
-      const chevron=hasVariants?'<button class="edit-btn" onclick="event.stopPropagation();toggleVariants(\\''+g.parentId+'\\',this)" style="transition:transform 0.15s;transform:rotate(-90deg)">${ICONS.back}</button>':'';
+      const chevron=hasVariants?'<button class="edit-btn" onclick="event.stopPropagation();toggleVariants(\\''+g.parentId+'\\',this)" style="transition:transform 0.15s;transform:rotate(180deg)">${ICONS.back}</button>':'';
       if(hasVariants){
         html+='<tr style="cursor:pointer" onclick="toggleVariants(\\''+g.parentId+'\\',this.querySelector(\\'button\\'))"><td style="text-align:center">'+chevron+'</td><td><strong>'+esc(g.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+g.variantCount+' variants)</span></td><td></td><td style="color:#6b7280;font-size:12px">$'+(g.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600;color:#4f46e5">$'+(g.teamPrice||0).toFixed(2)+'</td><td>'+g.totalStock+'</td></tr>';
       }else{
@@ -1650,10 +1648,10 @@ function renderImportTable(team){
 }
 
 function toggleVariants(parentId,btn){
-  const rows=document.querySelectorAll('.vr-'+parentId);
+  const rows=document.querySelectorAll('.vr-'+CSS.escape(parentId));
   const showing=rows[0]&&rows[0].style.display!=='none';
   rows.forEach(r=>r.style.display=showing?'none':'table-row');
-  if(btn)btn.style.transform=showing?'rotate(-90deg)':'rotate(0deg)';
+  if(btn)btn.style.transform=showing?'rotate(180deg)':'rotate(90deg)';
 }
 async function syncTeam(priceBookId,teamName){
   const btn=document.getElementById('sync-btn');
@@ -1711,7 +1709,7 @@ async function renderProducts(){
       const minTeamP=Math.min(...group.items.map(p=>p.teamPrice||999999));
       const minRetailP=Math.min(...group.items.map(p=>p.retailPrice||999999));
       const totalStockP=group.items.reduce((s,p)=>s+(p.stock||0),0);
-      html+='<tr style="cursor:pointer" onclick="toggleVariants(\\'pv-'+pid+'\\',this.querySelector(\\'button\\'))"><td style="text-align:center"><button class="edit-btn" onclick="event.stopPropagation();toggleVariants(\\'pv-'+pid+'\\',this)" style="transition:transform 0.15s;transform:rotate(-90deg)">${ICONS.back}</button></td><td><strong>'+esc(group.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+group.items.length+' variants)</span></td><td></td><td style="font-weight:600;color:#4f46e5">$'+minTeamP.toFixed(2)+'</td><td style="color:#9ca3af">$'+minRetailP.toFixed(2)+'</td><td>'+totalStockP+'</td></tr>';
+      html+='<tr style="cursor:pointer" onclick="toggleVariants(\\'pv-'+pid+'\\',this.querySelector(\\'button\\'))"><td style="text-align:center"><button class="edit-btn" onclick="event.stopPropagation();toggleVariants(\\'pv-'+pid+'\\',this)" style="transition:transform 0.15s;transform:rotate(180deg)">${ICONS.back}</button></td><td><strong>'+esc(group.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+group.items.length+' variants)</span></td><td></td><td style="font-weight:600;color:#4f46e5">$'+minTeamP.toFixed(2)+'</td><td style="color:#9ca3af">$'+minRetailP.toFixed(2)+'</td><td>'+totalStockP+'</td></tr>';
       for(const p of group.items){
         html+='<tr class="variant-row pv-'+pid+'" style="display:none"><td></td><td style="padding-left:32px;color:#6b7280;font-size:12px">'+esc(p.variantLabel||p.variantName||'-')+'</td><td style="color:#6b7280;font-size:12px">'+esc(p.sku||'-')+'</td><td style="font-weight:600;color:#4f46e5;font-size:12px">$'+(p.teamPrice||0).toFixed(2)+'</td><td style="color:#9ca3af;font-size:12px">$'+(p.retailPrice||0).toFixed(2)+'</td><td>'+(p.stock>0?'<span class="badge-status badge-success">'+p.stock+'</span>':'<span style="color:#9ca3af">0</span>')+'</td></tr>';
       }
