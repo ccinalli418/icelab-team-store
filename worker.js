@@ -640,7 +640,7 @@ async function getLightspeedSaleConfig(env, steps) {
     const ptData = await lsFetch(env, 'payment_types');
     const paymentTypes = ptData.payment_types || ptData.data || [];
     log(5, 'Fetch payment types', 'ok', paymentTypes.map(pt => ({ id: pt.id, name: pt.name })));
-    const lsPay = paymentTypes.find(pt => pt.name === 'Lightspeed Payments');
+    const lsPay = paymentTypes.find(pt => pt.name === 'Team Store Online');
     const selected = lsPay || paymentTypes[0];
     if (selected) {
       config.paymentTypeId = selected.id;
@@ -691,7 +691,7 @@ async function apiTestOrder(request, env) {
     register_id: saleConfig.registerId,
     user_id: saleConfig.userId,
     customer_id: customerId,
-    status: 'LAYBY',
+    status: 'CLOSED',
     note: `TEST ORDER - ${team.name} | Test from Team Store Admin`,
     register_sale_products: [{
       product_id: testProduct.lightspeedProductId,
@@ -758,7 +758,7 @@ async function createLightspeedSale(env, order) {
   const salePayload = {
     register_id: saleConfig.registerId,
     user_id: saleConfig.userId,
-    status: 'LAYBY',
+    status: 'CLOSED',
     note: `TEAM ORDER - ${order.teamName || 'Team Store'} | Paid via Stripe | Order #${orderNum}`,
     register_sale_products: saleProducts
   };
