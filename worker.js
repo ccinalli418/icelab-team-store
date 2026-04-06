@@ -216,6 +216,7 @@ async function syncPriceBook(env, priceBookId) {
         variantName: product.variant_name || pbName,
         variantLabel: variantLabel,
         sku: product.sku || '',
+        description: product.description || '',
         retailPrice: parseFloat(product.price_including_tax || 0),
         teamPrice: parseFloat(pbp.price || 0),
         imageUrl,
@@ -348,6 +349,7 @@ async function apiGetProduct(url, productId, env) {
     return json({
       id: productId,
       name: first.name,
+      description: first.description || '',
       brand: first.brand,
       type: first.type,
       imageUrl: first.imageUrl || variants.find(v => v.imageUrl)?.imageUrl || null,
@@ -380,6 +382,7 @@ async function apiGetProduct(url, productId, env) {
   return json({
     id: product.lightspeedProductId,
     name: product.name,
+    description: product.description || '',
     brand: product.brand,
     type: product.type,
     imageUrl: product.imageUrl,
@@ -1287,7 +1290,7 @@ async function showProduct(prodId){
   }
 
   const m=document.getElementById('main-content');
-  m.innerHTML='<a class="back-link" onclick="showHome()">${ICONS.back} Back</a><div class="pd"><div class="pd-layout"><div class="pd-image">'+img+'</div><div class="pd-info"><h2>'+esc(p.name)+'</h2>'+(p.brand?'<div class="pd-brand">'+esc(p.brand)+'</div>':'')+'<div class="price" id="pd-price">$'+(p.teamPrice||0).toFixed(2)+'</div>'+(p.retailPrice>(p.teamPrice||0)?'<div class="retail-price" id="pd-retail">$'+p.retailPrice.toFixed(2)+'</div>':'')+'<div id="pd-stock-info">'+stockHtml+'</div>'+variantHtml+'<div class="qty-row"><span style="color:#6b7280;font-size:13px;font-weight:500">Qty</span><button class="qty-btn" onclick="changeQty(-1)">-</button><span class="qty-val" id="pd-qty">1</span><button class="qty-btn" onclick="changeQty(1)">+</button></div><button class="btn btn-primary btn-full btn-lg" id="btn-add" onclick="addToCart()"'+(p.variants&&p.variants.length?' disabled':'')+'>Add to Cart</button></div></div></div>';
+  m.innerHTML='<a class="back-link" onclick="showHome()">${ICONS.back} Back</a><div class="pd"><div class="pd-layout"><div class="pd-image">'+img+'</div><div class="pd-info"><h2>'+esc(p.name)+'</h2>'+(p.brand?'<div class="pd-brand">'+esc(p.brand)+'</div>':'')+'<div class="price" id="pd-price">$'+(p.teamPrice||0).toFixed(2)+'</div>'+(p.retailPrice>(p.teamPrice||0)?'<div class="retail-price" id="pd-retail">$'+p.retailPrice.toFixed(2)+'</div>':'')+(p.description?'<p style="color:#6b7280;font-size:14px;line-height:1.6;margin-bottom:16px">'+esc(p.description)+'</p>':'')+'<div id="pd-stock-info">'+stockHtml+'</div>'+variantHtml+'<div class="qty-row"><span style="color:#6b7280;font-size:13px;font-weight:500">Qty</span><button class="qty-btn" onclick="changeQty(-1)">-</button><span class="qty-val" id="pd-qty">1</span><button class="qty-btn" onclick="changeQty(1)">+</button></div><button class="btn btn-primary btn-full btn-lg" id="btn-add" onclick="addToCart()"'+(p.variants&&p.variants.length?' disabled':'')+'>Add to Cart</button></div></div></div>';
 }
 
 function parseVariantAttributes(variants){
@@ -1656,9 +1659,10 @@ function renderImportTable(team){
       }else{
         html+='<tr><td></td><td><strong>'+esc(g.name)+'</strong></td><td style="color:#6b7280;font-size:12px">'+esc(g.sku||'-')+'</td><td style="color:#6b7280;font-size:12px">$'+(g.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600;color:#4f46e5">$'+(g.teamPrice||0).toFixed(2)+'</td><td style="font-weight:600">'+g.totalStock+'</td></tr>';
       }
-      // Variant rows - hidden by default
+      // Variant rows - hidden by default, sorted
       if(hasVariants){
-        for(const v of g.variants){
+        const sorted=[...g.variants].sort(sortVariantLabel);
+        for(const v of sorted){
           html+='<tr class="variant-row vr-'+g.parentId+'" style="display:none"><td></td><td style="padding-left:32px;color:#6b7280;font-size:12px">'+esc(v.variantLabel||v.variantName||'-')+'</td><td style="color:#6b7280;font-size:12px">'+esc(v.sku||'-')+'</td><td style="font-size:12px">$'+(v.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600;color:#4f46e5;font-size:12px">$'+(v.teamPrice||0).toFixed(2)+'</td><td style="font-weight:600">'+(v.stock||0)+'</td></tr>';
         }
       }
@@ -1672,8 +1676,29 @@ function renderImportTable(team){
 function toggleVariants(parentId,btn){
   const rows=document.querySelectorAll('.vr-'+CSS.escape(parentId));
   const showing=rows[0]&&rows[0].style.display!=='none';
+  if(!showing){
+    // Close all other open groups first
+    document.querySelectorAll('.variant-row').forEach(r=>{if(!r.classList.contains('vr-'+parentId))r.style.display='none'});
+    document.querySelectorAll('.edit-btn').forEach(b=>{if(b!==btn)b.style.transform='rotate(180deg)'});
+  }
   rows.forEach(r=>r.style.display=showing?'none':'table-row');
   if(btn)btn.style.transform=showing?'rotate(180deg)':'rotate(270deg)';
+}
+function sortVariantLabel(a,b){
+  const sizeOrder={XS:1,S:2,M:3,L:4,XL:5,'2XL':6,XXL:6,'3XL':7};
+  const pa=(a.variantLabel||a.variantName||'').split(' / ').map(s=>s.trim());
+  const pb=(b.variantLabel||b.variantName||'').split(' / ').map(s=>s.trim());
+  for(let i=0;i<Math.max(pa.length,pb.length);i++){
+    const va=pa[i]||'',vb=pb[i]||'';
+    // Size sort
+    if(sizeOrder[va]||sizeOrder[vb]){const d=(sizeOrder[va]||50)-(sizeOrder[vb]||50);if(d)return d;continue}
+    // Numeric sort (flex) - descending for flex
+    const na=parseFloat(va),nb=parseFloat(vb);
+    if(!isNaN(na)&&!isNaN(nb)){const d=nb-na;if(d)return d;continue}
+    // Alpha sort
+    const d=va.localeCompare(vb);if(d)return d;
+  }
+  return 0;
 }
 async function syncTeam(priceBookId,teamName){
   const btn=document.getElementById('sync-btn');
@@ -1732,7 +1757,8 @@ async function renderProducts(){
       const minRetailP=Math.min(...group.items.map(p=>p.retailPrice||999999));
       const totalStockP=group.items.reduce((s,p)=>s+(p.stock||0),0);
       html+='<tr style="cursor:pointer" onclick="toggleVariants(\\'pv-'+pid+'\\',this.querySelector(\\'button\\'))"><td style="text-align:center"><button class="edit-btn" onclick="event.stopPropagation();toggleVariants(\\'pv-'+pid+'\\',this)" style="transition:transform 0.15s;transform:rotate(180deg)">${ICONS.back}</button></td><td><strong>'+esc(group.name)+'</strong> <span style="color:#6b7280;font-size:11px">('+group.items.length+' variants)</span></td><td></td><td style="font-weight:600;color:#4f46e5">$'+minTeamP.toFixed(2)+'</td><td style="color:#9ca3af">$'+minRetailP.toFixed(2)+'</td><td style="font-weight:600">'+totalStockP+'</td></tr>';
-      for(const p of group.items){
+      const sortedItems=[...group.items].sort(sortVariantLabel);
+      for(const p of sortedItems){
         html+='<tr class="variant-row pv-'+pid+'" style="display:none"><td></td><td style="padding-left:32px;color:#6b7280;font-size:12px">'+esc(p.variantLabel||p.variantName||'-')+'</td><td style="color:#6b7280;font-size:12px">'+esc(p.sku||'-')+'</td><td style="font-weight:600;color:#4f46e5;font-size:12px">$'+(p.teamPrice||0).toFixed(2)+'</td><td style="font-size:12px">$'+(p.retailPrice||0).toFixed(2)+'</td><td style="font-weight:600">'+(p.stock||0)+'</td></tr>';
       }
     }
