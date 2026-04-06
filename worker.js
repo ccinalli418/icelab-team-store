@@ -221,7 +221,9 @@ async function syncPriceBook(env, priceBookId) {
         imageUrl,
         stock,
         supplyPrice: parseFloat(product.supply_price || 0),
-        brand: product.brand?.name || product.supplier?.name || '',
+        brand: product.brand?.name || '',
+        supplierId: product.supplier_id || product.supplier?.id || null,
+        supplierName: product.supplier?.name || '',
         type: product.type?.name || '',
         hasVariants: product.has_variants || false,
         discount: pbp.discount || null,
@@ -350,6 +352,9 @@ async function apiGetProduct(url, productId, env) {
       imageUrl: first.imageUrl || variants.find(v => v.imageUrl)?.imageUrl || null,
       retailPrice: first.retailPrice,
       teamPrice: first.teamPrice,
+      supplierId: first.supplierId,
+      supplierName: first.supplierName,
+      supplyPrice: first.supplyPrice,
       hasVariants: true,
       totalStock: variants.reduce((s, v) => s + (v.stock || 0), 0),
       variants: variants.map(v => ({
@@ -359,7 +364,10 @@ async function apiGetProduct(url, productId, env) {
         retailPrice: v.retailPrice,
         teamPrice: v.teamPrice,
         stock: v.stock,
-        imageUrl: v.imageUrl
+        imageUrl: v.imageUrl,
+        supplierId: v.supplierId,
+        supplierName: v.supplierName,
+        supplyPrice: v.supplyPrice
       }))
     });
   }
@@ -474,11 +482,13 @@ async function apiStripeWebhook(request, env) {
       notificationSent: false
     };
 
-    // Create Lightspeed sale
+    // Create Lightspeed sale + auto POs for out-of-stock items
     if (env.LIGHTSPEED_API_TOKEN) {
       try {
-        const saleId = await createLightspeedSale(env, order);
-        order.lightspeedSaleId = saleId;
+        const result = await createLightspeedSale(env, order);
+        order.lightspeedSaleId = result.saleId;
+        order.lightspeedInvoice = result.invoiceNumber;
+        order.poResults = result.poResults || [];
       } catch (e) {
         console.error('Lightspeed sale creation failed:', e.message);
         order.lightspeedSyncFailed = true;
@@ -715,19 +725,37 @@ async function apiTestOrder(request, env) {
     productUsed: { name: testProduct.variantName || testProduct.name, sku: testProduct.sku, teamPrice: testProduct.teamPrice }
   }});
 
-  // STEP 7: Create sale (only if body.confirm === true)
+  // STEP 7: Create sale + POs (only if body.confirm === true)
   if (body.confirm) {
     try {
-      const saleResp = await lsFetchLegacy(env, 'register_sales', { method: 'POST', body: JSON.stringify(salePayload) });
-      const sale = saleResp.register_sale || saleResp.data || saleResp;
-      saleId = sale.id;
+      const testOrder = {
+        id: generateId('ord'),
+        teamName: team.name,
+        customer: testCustomer,
+        items: [{
+          lightspeedProductId: testProduct.lightspeedProductId,
+          name: testProduct.name,
+          variantName: testProduct.variantLabel || testProduct.variantName || '',
+          teamPrice: testProduct.teamPrice,
+          price: testProduct.teamPrice,
+          qty: 1,
+          stock: testProduct.stock || 0,
+          supplierId: testProduct.supplierId || null,
+          supplierName: testProduct.supplierName || '',
+          supplyPrice: testProduct.supplyPrice || 0
+        }],
+        total: testProduct.teamPrice
+      };
+      const result = await createLightspeedSale(env, testOrder);
+      saleId = result.saleId;
       steps.push({ step: 7, action: 'Create sale in Lightspeed', status: 'created', detail: {
-        id: sale.id,
-        receipt_number: sale.receipt_number,
-        status: sale.status,
-        total: sale.total_price || sale.totals?.total_payment,
-        customer_id: sale.customer_id
+        saleId: result.saleId,
+        invoiceNumber: result.invoiceNumber,
+        status: 'AWAITING_PICKUP'
       }});
+      if (result.poResults?.length) {
+        steps.push({ step: 8, action: 'Auto-create purchase orders', status: 'created', detail: result.poResults });
+      }
     } catch (e) {
       steps.push({ step: 7, action: 'Create sale in Lightspeed', status: 'error', detail: e.message });
     }
@@ -735,7 +763,7 @@ async function apiTestOrder(request, env) {
     steps.push({ step: 7, action: 'Create sale in Lightspeed', status: 'skipped', detail: 'Send with "confirm": true to actually create the sale' });
   }
 
-  return json({ steps, customer: testCustomer, teamName: team.name, saleId });
+  return json({ steps, customer: testCustomer, teamName: team.name, saleId, testProduct: { name: testProduct.name, stock: testProduct.stock, supplierId: testProduct.supplierId, supplierName: testProduct.supplierName } });
 }
 
 // ============================================================
@@ -774,7 +802,89 @@ async function createLightspeedSale(env, order) {
   }
 
   const saleResp = await lsFetchLegacy(env, 'register_sales', { method: 'POST', body: JSON.stringify(salePayload) });
-  return saleResp.register_sale?.id || saleResp.id || 'unknown';
+  const saleId = saleResp.register_sale?.id || saleResp.id || 'unknown';
+  const invoiceNumber = saleResp.register_sale?.invoice_number || saleResp.invoice_number || '';
+
+  // Auto-create POs for out-of-stock items
+  let poResults = [];
+  try {
+    poResults = await createPurchaseOrders(env, order, orderNum);
+  } catch (e) { console.error('PO creation failed:', e.message); }
+
+  return { saleId, invoiceNumber, poResults };
+}
+
+// ============================================================
+// AUTO-CREATE PURCHASE ORDERS for out-of-stock items
+// ============================================================
+async function createPurchaseOrders(env, order, orderNum) {
+  const OUTLET_ID = '06f24f8b-21fd-11ef-f4ca-66ee517e9e59'; // Ice Lab Pro Shop
+  const poResults = [];
+
+  // Find out-of-stock items and group by supplier
+  const oosItems = (order.items || []).filter(item => (item.stock || 0) <= 0);
+  if (!oosItems.length) return poResults;
+
+  // Group by supplierId
+  const bySupplier = {};
+  for (const item of oosItems) {
+    const sid = item.supplierId || 'unknown';
+    if (!bySupplier[sid]) bySupplier[sid] = { supplierId: sid, supplierName: item.supplierName || 'Unknown Supplier', items: [] };
+    bySupplier[sid].items.push(item);
+  }
+
+  for (const [supplierId, group] of Object.entries(bySupplier)) {
+    try {
+      // Create the consignment (PO)
+      const poPayload = {
+        name: `Team Order #${orderNum} - ${order.teamName || 'Team Store'}`,
+        outlet_id: OUTLET_ID,
+        type: 'SUPPLIER',
+        status: 'OPEN',
+        supplier_id: supplierId !== 'unknown' ? supplierId : undefined
+      };
+
+      const poResp = await lsFetch(env, 'consignments', { method: 'POST', body: JSON.stringify(poPayload) });
+      const po = poResp.data || poResp;
+      const poId = po.id;
+      const poRef = po.reference || poId?.slice(-6) || '';
+
+      // Add products to the PO
+      for (const item of group.items) {
+        const prodId = item.lightspeedProductId || item.lightspeedId || item.productId;
+        try {
+          await lsFetch(env, `consignments/${poId}/products`, {
+            method: 'POST',
+            body: JSON.stringify({
+              product_id: prodId,
+              count: item.qty,
+              cost: item.supplyPrice || 0
+            })
+          });
+        } catch (e) { console.error(`Failed to add product ${prodId} to PO:`, e.message); }
+      }
+
+      // Calculate PO total (supply cost)
+      const poTotal = group.items.reduce((sum, item) => sum + ((item.supplyPrice || 0) * item.qty), 0);
+      const belowMinimum = poTotal < 250 && (group.supplierName.toLowerCase().includes('bauer') || group.supplierName.toLowerCase().includes('ccm'));
+
+      poResults.push({
+        poId,
+        reference: poRef,
+        supplierId,
+        supplierName: group.supplierName,
+        itemCount: group.items.length,
+        totalCost: poTotal,
+        belowMinimum,
+        items: group.items.map(i => ({ name: i.name, variantName: i.variantName, qty: i.qty, supplyPrice: i.supplyPrice || 0 }))
+      });
+    } catch (e) {
+      console.error(`PO creation failed for supplier ${group.supplierName}:`, e.message);
+      poResults.push({ error: e.message, supplierName: group.supplierName });
+    }
+  }
+
+  return poResults;
 }
 
 // ============================================================
@@ -784,26 +894,68 @@ async function sendOrderNotification(env, order) {
   const notifyEmail = env.NOTIFICATION_EMAIL || 'hello@icelabproshop.com';
   const orderNum = order.id.slice(-6).toUpperCase();
 
+  // Categorize items by stock status
+  const inStockItems = (order.items || []).filter(i => (i.stock || 0) > 0);
+  const oosItems = (order.items || []).filter(i => (i.stock || 0) <= 0);
+
   const itemRows = (order.items || []).map(item => {
     const name = item.name || 'Product';
     const variant = item.variantName ? ` - ${item.variantName}` : '';
-    return `<tr><td style="padding:8px;border-bottom:1px solid #eee">${name}${variant}</td><td style="padding:8px;border-bottom:1px solid #eee;text-align:center">${item.qty}</td><td style="padding:8px;border-bottom:1px solid #eee;text-align:right">$${((item.teamPrice || item.price || 0) * item.qty).toFixed(2)}</td></tr>`;
+    const stockStatus = (item.stock || 0) > 0
+      ? '<span style="color:#16a34a;font-weight:600">IN STOCK - Pull from shelf</span>'
+      : '<span style="color:#2563eb;font-weight:600">SPECIAL ORDER - PO created</span>';
+    return `<tr><td style="padding:8px;border-bottom:1px solid #eee">${name}${variant}</td><td style="padding:8px;border-bottom:1px solid #eee;text-align:center">${item.qty}</td><td style="padding:8px;border-bottom:1px solid #eee;text-align:right">$${((item.teamPrice || item.price || 0) * item.qty).toFixed(2)}</td><td style="padding:8px;border-bottom:1px solid #eee">${stockStatus}</td></tr>`;
   }).join('');
 
+  // PO section
+  let poHtml = '';
+  if (order.poResults?.length) {
+    poHtml = '<h3 style="color:#4f46e5;margin-top:24px">Purchase Orders Created</h3>';
+    for (const po of order.poResults) {
+      if (po.error) {
+        poHtml += `<p style="color:#dc2626">PO creation failed for ${po.supplierName}: ${po.error}</p>`;
+        continue;
+      }
+      const warningHtml = po.belowMinimum
+        ? `<p style="background:#fffbeb;border:1px solid #fbbf24;padding:8px 12px;border-radius:6px;color:#92400e;margin:8px 0"><strong>WARNING:</strong> PO total $${po.totalCost.toFixed(2)} is under $250 minimum for ${po.supplierName}. Consider combining with other orders before sending.</p>`
+        : '';
+      const poItems = po.items.map(i => `<tr><td style="padding:6px 8px;border-bottom:1px solid #eee">${i.name}${i.variantName ? ' - ' + i.variantName : ''}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:center">${i.qty}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right">$${(i.supplyPrice * i.qty).toFixed(2)}</td></tr>`).join('');
+      poHtml += `<div style="background:#f8f9fa;border:1px solid #e5e7eb;border-radius:8px;padding:16px;margin:12px 0">
+        <p><strong>Supplier:</strong> ${po.supplierName}</p>
+        <p><strong>PO #:</strong> ${po.reference}</p>
+        <p><strong>Items:</strong> ${po.itemCount} | <strong>Cost Total:</strong> $${po.totalCost.toFixed(2)}</p>
+        ${warningHtml}
+        <table style="width:100%;border-collapse:collapse;margin-top:8px;font-size:13px">
+          <thead><tr style="background:#e5e7eb"><th style="padding:6px 8px;text-align:left">Item</th><th style="padding:6px 8px;text-align:center">Qty</th><th style="padding:6px 8px;text-align:right">Cost</th></tr></thead>
+          <tbody>${poItems}</tbody>
+        </table>
+        <p style="margin-top:8px;color:#6b7280;font-size:13px">Review this PO in Lightspeed > Inventory > Stock Orders, then send to supplier.</p>
+      </div>`;
+    }
+  }
+
+  // Action items
+  let actionHtml = '<h3 style="margin-top:24px">Action Required</h3><ul style="margin:8px 0;padding-left:20px">';
+  if (inStockItems.length) actionHtml += `<li style="margin:4px 0"><strong>${inStockItems.length} item(s) in stock</strong> - Pull from shelf and set aside for customer pickup</li>`;
+  if (oosItems.length) actionHtml += `<li style="margin:4px 0"><strong>${oosItems.length} item(s) special order</strong> - PO(s) created in Lightspeed. Review and send to supplier.</li>`;
+  actionHtml += '<li style="margin:4px 0">Check Lightspeed > Fulfillments > Customer pickup for this order</li></ul>';
+
   const html = `
-    <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+    <div style="font-family:sans-serif;max-width:650px;margin:0 auto">
       <h2 style="color:#4f46e5">New Team Store Order</h2>
       <p><strong>Order #:</strong> ${orderNum}</p>
       <p><strong>Team:</strong> ${order.teamName || 'N/A'}</p>
       <p><strong>Customer:</strong> ${order.customer?.name || 'N/A'}</p>
       <p><strong>Email:</strong> ${order.customer?.email || 'N/A'}</p>
       <p><strong>Phone:</strong> ${order.customer?.phone || 'N/A'}</p>
-      ${order.lightspeedSaleId ? `<p><strong>Lightspeed Sale:</strong> ${order.lightspeedSaleId}</p>` : '<p style="color:#dc2626"><strong>Lightspeed sync failed - create sale manually</strong></p>'}
+      ${order.lightspeedSaleId ? `<p><strong>Lightspeed Sale #:</strong> ${order.lightspeedInvoice || order.lightspeedSaleId}</p>` : '<p style="color:#dc2626"><strong>Lightspeed sync failed - create sale manually</strong></p>'}
       <table style="width:100%;border-collapse:collapse;margin:16px 0">
-        <thead><tr style="background:#f8f9fa"><th style="padding:8px;text-align:left">Item</th><th style="padding:8px;text-align:center">Qty</th><th style="padding:8px;text-align:right">Total</th></tr></thead>
+        <thead><tr style="background:#f8f9fa"><th style="padding:8px;text-align:left">Item</th><th style="padding:8px;text-align:center">Qty</th><th style="padding:8px;text-align:right">Price</th><th style="padding:8px;text-align:left">Status</th></tr></thead>
         <tbody>${itemRows}</tbody>
-        <tfoot><tr><td colspan="2" style="padding:8px;font-weight:bold">Total</td><td style="padding:8px;text-align:right;font-weight:bold">$${(order.total || 0).toFixed(2)}</td></tr></tfoot>
+        <tfoot><tr><td colspan="2" style="padding:8px;font-weight:bold">Total</td><td style="padding:8px;text-align:right;font-weight:bold">$${(order.total || 0).toFixed(2)}</td><td></td></tr></tfoot>
       </table>
+      ${poHtml}
+      ${actionHtml}
     </div>`;
 
   await fetch('https://api.mailchannels.net/tx/v1/send', {
@@ -1119,13 +1271,21 @@ function addToCart(){
   let variantName='';
   let lightspeedProductId=p.id;
 
+  let stock=p.totalStock||p.stock||0;
+  let supplierId=p.supplierId||null;
+  let supplierName=p.supplierName||'';
+  let supplyPrice=p.supplyPrice||0;
+
   if(varSel&&varSel.value){
-    const opt=varSel.options[varSel.selectedIndex];
     const sv=p.variants.find(v=>v.id===varSel.value);
     if(sv){
       teamPrice=sv.teamPrice||teamPrice;
       variantName=sv.name||'';
       lightspeedProductId=sv.id;
+      stock=sv.stock||0;
+      if(sv.supplierId)supplierId=sv.supplierId;
+      if(sv.supplierName)supplierName=sv.supplierName;
+      if(sv.supplyPrice)supplyPrice=sv.supplyPrice;
     }
   }
 
@@ -1136,7 +1296,11 @@ function addToCart(){
     teamPrice,
     price:teamPrice,
     qty:window._pdQty||1,
-    imageUrl:p.imageUrl||null
+    imageUrl:p.imageUrl||null,
+    stock,
+    supplierId,
+    supplierName,
+    supplyPrice
   };
   const ei=cart.findIndex(c=>c.lightspeedProductId===ci.lightspeedProductId);
   if(ei>=0)cart[ei].qty+=ci.qty;
