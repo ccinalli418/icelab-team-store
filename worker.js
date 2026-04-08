@@ -204,10 +204,13 @@ async function syncPriceBook(env, priceBookId) {
         }
       } catch (e) { /* inventory fetch failed, default 0 */ }
 
-      // Check image - skip placeholder
-      let imageUrl = product.image_url || null;
-      if (imageUrl && imageUrl.includes('no-image-white-standard')) imageUrl = null;
+      // Check image - skip placeholder, check skuImages first (where Lightspeed stores actual images)
+      let imageUrl = null;
+      if (product.skuImages && product.skuImages.length > 0) {
+        imageUrl = product.skuImages[0].sizes?.standard || product.skuImages[0].sizes?.original || product.skuImages[0].url || null;
+      }
       if (!imageUrl && product.images && product.images.length > 0) imageUrl = product.images[0].url || null;
+      if (!imageUrl && product.image_url && !product.image_url.includes('no-image-white')) imageUrl = product.image_url;
 
       enriched.push({
         lightspeedProductId: pbp.product_id,
