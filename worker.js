@@ -175,6 +175,7 @@ async function syncPriceBook(env, priceBookId) {
 
   // 2. Fetch product details for each (batched)
   const enriched = [];
+  const parentImageCache = {}; // Cache parent images to avoid duplicate fetches
   for (const pbp of pbProducts) {
     try {
       const detail = await lsFetch(env, `products/${pbp.product_id}`);
@@ -204,17 +205,39 @@ async function syncPriceBook(env, priceBookId) {
         }
       } catch (e) { /* inventory fetch failed, default 0 */ }
 
-      // Collect all images - check skuImages first, then images, then image_url
+      // Collect images: check product.images first (parent gallery), then skuImages (variant image)
       let allImages = [];
-      if (product.skuImages && product.skuImages.length > 0) {
+      if (product.images && product.images.length > 0) {
+        allImages = product.images.map(img => ({
+          standard: img.sizes?.standard || img.url || null,
+          full: img.sizes?.original || img.url || null,
+          thumb: img.sizes?.thumb || img.url || null
+        })).filter(img => img.standard);
+      }
+      if (!allImages.length && product.skuImages && product.skuImages.length > 0) {
         allImages = product.skuImages.map(img => ({
           standard: img.sizes?.standard || img.url || null,
           full: img.sizes?.original || img.sizes?.raw || img.url || null,
           thumb: img.sizes?.thumb || img.sizes?.st || img.url || null
         })).filter(img => img.standard);
       }
-      if (!allImages.length && product.images && product.images.length > 0) {
-        allImages = product.images.map(img => ({ standard: img.url, full: img.url, thumb: img.url })).filter(img => img.standard);
+      // For variants, always fetch parent product images (the gallery lives on the parent)
+      if (product.variant_parent_id) {
+        const pid = product.variant_parent_id;
+        if (parentImageCache[pid] === undefined) {
+          try {
+            const parentDetail = await lsFetch(env, `products/${pid}`);
+            const parentProd = parentDetail.data || parentDetail;
+            parentImageCache[pid] = (parentProd.images && parentProd.images.length > 0)
+              ? parentProd.images.map(img => ({
+                  standard: img.sizes?.standard || img.url || null,
+                  full: img.sizes?.original || img.url || null,
+                  thumb: img.sizes?.thumb || img.url || null
+                })).filter(img => img.standard)
+              : [];
+          } catch (e) { parentImageCache[pid] = []; }
+        }
+        if (parentImageCache[pid].length) allImages = [...parentImageCache[pid]];
       }
       let imageUrl = allImages[0]?.standard || null;
       if (!imageUrl && product.image_url && !product.image_url.includes('no-image-white')) imageUrl = product.image_url;
