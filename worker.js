@@ -1253,10 +1253,10 @@ function showHome(){
   // Category tabs
   if(cats.length>1){
     html+='<div style="display:flex;gap:0;border-bottom:1px solid #e5e7eb;margin-bottom:20px;overflow-x:auto">';
-    html+='<button onclick="selectedCategory=\\'\\'all\\'\\';;showHome()" style="padding:10px 18px;border:none;background:none;cursor:pointer;font-family:inherit;font-size:13px;font-weight:500;border-bottom:2px solid '+(selectedCategory==='all'?'#4f46e5':'transparent')+';color:'+(selectedCategory==='all'?'#4f46e5':'#6b7280')+'">All</button>';
+    html+='<button onclick="selectCat(this,\\'all\\')" style="padding:10px 18px;border:none;background:none;cursor:pointer;font-family:inherit;font-size:13px;font-weight:500;border-bottom:2px solid '+(selectedCategory==='all'?'#4f46e5':'transparent')+';color:'+(selectedCategory==='all'?'#4f46e5':'#6b7280')+'">All</button>';
     for(const cat of cats){
       const active=selectedCategory===cat;
-      html+='<button onclick="selectedCategory=\\''+esc(cat)+'\\';showHome()" style="padding:10px 18px;border:none;background:none;cursor:pointer;font-family:inherit;font-size:13px;font-weight:500;white-space:nowrap;border-bottom:2px solid '+(active?'#4f46e5':'transparent')+';color:'+(active?'#4f46e5':'#6b7280')+'">'+esc(cat)+'</button>';
+      html+='<button onclick="selectCat(this,\\''+esc(cat)+'\\')" style="padding:10px 18px;border:none;background:none;cursor:pointer;font-family:inherit;font-size:13px;font-weight:500;white-space:nowrap;border-bottom:2px solid '+(active?'#4f46e5':'transparent')+';color:'+(active?'#4f46e5':'#6b7280')+'">'+esc(cat)+'</button>';
     }
     html+='</div>';
   }
@@ -1291,6 +1291,7 @@ function fuzzyMatch(query,text){
   return qWords.every(qw=>tWords.some(tw=>tw.includes(qw)||qw.includes(tw)||levenshtein(qw,tw)<=2));
 }
 
+function selectCat(btn,cat){selectedCategory=cat;showHome()}
 function onStoreSearch(val){
   storeSearchQuery=val;
   if(_searchDebounce)clearTimeout(_searchDebounce);
