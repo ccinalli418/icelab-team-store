@@ -589,50 +589,46 @@ async function verifyStripeSignature(payload, sigHeader, secret) {
 // ============================================================
 
 // Find or create customer in Lightspeed
-// Search by email (exact match, skip null/empty emails), then by phone, then create
+// 1. Check KV cache first (instant)
+// 2. Search Lightspeed by email (paginated, exact match)
+// 3. Create if not found, cache the ID
 async function lsFindOrCreateCustomer(env, customer, steps) {
   const log = (step, action, status, detail) => { if (steps) steps.push({ step, action, status, detail }); };
 
   let customerId = null;
+  const emailKey = customer.email ? `ls_customer:${customer.email.toLowerCase()}` : null;
 
-  // Step 1a: Search by email
+  // Step 1: Check KV cache
+  if (emailKey) {
+    const cached = await env.STORE_DATA.get(emailKey);
+    if (cached) {
+      customerId = cached;
+      log(1, 'Customer lookup (cached)', 'found', { id: customerId, email: customer.email });
+      return customerId;
+    }
+  }
+
+  // Step 2: Search Lightspeed with page_size=2000 and exact email match
   if (customer.email) {
     try {
-      const custSearch = await lsFetch(env, `customers?email=${encodeURIComponent(customer.email)}`);
+      const custSearch = await lsFetch(env, `customers?page_size=2000`);
       const customers = (custSearch.customers || custSearch.data || [])
-        .filter(c => c.email && c.email.trim() !== '' && c.email.toLowerCase() === customer.email.toLowerCase());
+        .filter(c => c.email && c.email.toLowerCase() === customer.email.toLowerCase());
       if (customers.length > 0) {
         customerId = customers[0].id;
+        // Cache for future lookups
+        if (emailKey) await env.STORE_DATA.put(emailKey, customerId);
         log(1, 'Search customer by email', 'found', { id: customerId, name: `${customers[0].first_name} ${customers[0].last_name}`, email: customers[0].email });
         return customerId;
       } else {
-        log(1, 'Search customer by email', 'not_found', { email: customer.email, note: 'No customer with matching non-null email' });
+        log(1, 'Search customer by email', 'not_found', { email: customer.email });
       }
     } catch (e) {
       log(1, 'Search customer by email', 'error', e.message);
     }
   }
 
-  // Step 1b: Search by phone
-  if (!customerId && customer.phone) {
-    try {
-      const phoneCleaned = customer.phone.replace(/[^0-9]/g, '');
-      const custSearch = await lsFetch(env, `customers?phone=${encodeURIComponent(customer.phone)}`);
-      const customers = (custSearch.customers || custSearch.data || [])
-        .filter(c => c.phone && c.phone.replace(/[^0-9]/g, '').includes(phoneCleaned.slice(-7)));
-      if (customers.length > 0) {
-        customerId = customers[0].id;
-        log('1b', 'Search customer by phone', 'found', { id: customerId, name: `${customers[0].first_name} ${customers[0].last_name}`, phone: customers[0].phone });
-        return customerId;
-      } else {
-        log('1b', 'Search customer by phone', 'not_found', { phone: customer.phone });
-      }
-    } catch (e) {
-      log('1b', 'Search customer by phone', 'error', e.message);
-    }
-  }
-
-  // Step 2: Create customer
+  // Step 3: Create customer
   if (!customerId) {
     try {
       const nameParts = (customer.name || '').split(' ');
@@ -646,6 +642,8 @@ async function lsFindOrCreateCustomer(env, customer, steps) {
       const newCust = await lsFetch(env, 'customers', { method: 'POST', body: JSON.stringify(payload) });
       const custData = newCust.data || newCust.customer || newCust;
       customerId = custData.id;
+      // Cache for future lookups
+      if (emailKey && customerId) await env.STORE_DATA.put(emailKey, customerId);
       log(2, 'Create customer', 'created', {
         id: customerId,
         response: { id: custData.id, first_name: custData.first_name, last_name: custData.last_name, email: custData.email, phone: custData.phone }
