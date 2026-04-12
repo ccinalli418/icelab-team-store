@@ -1201,7 +1201,7 @@ function storePage() {
 <script>
 let products=[],cart=JSON.parse(sessionStorage.getItem('team_cart')||'[]'),currentView='home';
 let teamContext=JSON.parse(sessionStorage.getItem('team_context')||'null');
-let storeSearchQuery='';let _searchDebounce=null;let selectedCategory='all';
+let storeSearchQuery='';let _searchDebounce=null;let selectedCategory='all';let sortBy='name-asc';
 
 // Check for ?team=slug param and show team name on PIN page
 (function(){
@@ -1281,12 +1281,20 @@ function showHome(){
     }
     html+='</div>';
   }
-  // Search
-  html+='<div style="margin-bottom:24px"><div style="position:relative"><input id="store-search" type="text" placeholder="Search products..." value="'+esc(storeSearchQuery)+'" oninput="onStoreSearch(this.value)" style="width:100%;padding:10px 12px 10px 36px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;background:#fff;font-family:inherit;outline:none;transition:border 0.15s"><span style="position:absolute;left:12px;top:50%;transform:translateY(-50%);color:#9ca3af;pointer-events:none">'+searchIcon+'</span>'+(storeSearchQuery?'<button onclick="onStoreSearch(\\'\\')" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:#9ca3af;cursor:pointer;padding:4px">'+xIcon+'</button>':'')+'</div></div>';
-  // Filter by category and search
+  // Search + Sort
+  html+='<div style="margin-bottom:24px;display:flex;gap:12px;align-items:center"><div style="position:relative;flex:1"><input id="store-search" type="text" placeholder="Search products..." value="'+esc(storeSearchQuery)+'" oninput="onStoreSearch(this.value)" style="width:100%;padding:10px 12px 10px 36px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;background:#fff;font-family:inherit;outline:none;transition:border 0.15s"><span style="position:absolute;left:12px;top:50%;transform:translateY(-50%);color:#9ca3af;pointer-events:none">'+searchIcon+'</span>'+(storeSearchQuery?'<button onclick="onStoreSearch(\\'\\')" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:#9ca3af;cursor:pointer;padding:4px">'+xIcon+'</button>':'')+'</div><select onchange="sortBy=this.value;showHome()" style="padding:10px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;background:#fff;font-family:inherit;color:#1a1a2e;cursor:pointer"><option value="name-asc"'+(sortBy==='name-asc'?' selected':'')+'>Name: A to Z</option><option value="name-desc"'+(sortBy==='name-desc'?' selected':'')+'>Name: Z to A</option><option value="price-asc"'+(sortBy==='price-asc'?' selected':'')+'>Price: Low to High</option><option value="price-desc"'+(sortBy==='price-desc'?' selected':'')+'>Price: High to Low</option><option value="stock-desc"'+(sortBy==='stock-desc'?' selected':'')+'>In Stock First</option></select></div>';
+  // Filter by category, search, and sort
   let filtered=products;
   if(selectedCategory&&selectedCategory!=='all')filtered=filtered.filter(p=>(p.category||p.type||'')===selectedCategory);
   if(storeSearchQuery)filtered=filtered.filter(p=>fuzzyMatch(storeSearchQuery,p.name||''));
+  filtered=[...filtered].sort((a,b)=>{
+    if(sortBy==='name-asc')return(a.name||'').localeCompare(b.name||'');
+    if(sortBy==='name-desc')return(b.name||'').localeCompare(a.name||'');
+    if(sortBy==='price-asc')return(a.teamPrice||0)-(b.teamPrice||0);
+    if(sortBy==='price-desc')return(b.teamPrice||0)-(a.teamPrice||0);
+    if(sortBy==='stock-desc'){const sa=a.totalStock||0,sb=b.totalStock||0;if(sa>0&&sb<=0)return -1;if(sb>0&&sa<=0)return 1;return(a.name||'').localeCompare(b.name||'')}
+    return 0;
+  });
   if(products.length===0){html+='<div class="loading">No products available yet. Check back soon!</div>'}
   else if(filtered.length===0){html+='<div class="loading">No products found</div>'}
   else{html+='<div class="pg">'+filtered.map(productCard).join('')+'</div>'}
