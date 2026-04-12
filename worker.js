@@ -12,13 +12,26 @@ export default {
     // --- API Routes ---
     if (path.startsWith('/api/')) {
       try {
+        // Public endpoints (no auth required)
         if (path === '/api/verify-pin' && method === 'POST') return apiVerifyPin(request, env);
         if (path === '/api/verify-admin-pin' && method === 'POST') return apiVerifyAdminPin(request, env);
         if (path === '/api/teams' && method === 'GET') return apiGetTeams(env);
+        if (path === '/api/stripe/webhook' && method === 'POST') return apiStripeWebhook(request, env);
+
+        // Storefront endpoints (require valid team auth token)
+        if (path === '/api/products' || path.match(/^\/api\/product\//) || path === '/api/checkout') {
+          const authErr = await verifyStoreAuth(request, env);
+          if (authErr) return authErr;
+        }
         if (path === '/api/products' && method === 'GET') return apiGetProducts(url, env);
         if (path.match(/^\/api\/product\/[^/]+$/) && method === 'GET') return apiGetProduct(url, path.split('/')[3], env);
         if (path === '/api/checkout' && method === 'POST') return apiCheckout(request, env);
-        if (path === '/api/stripe/webhook' && method === 'POST') return apiStripeWebhook(request, env);
+
+        // Admin endpoints (require valid admin auth token)
+        if (path.startsWith('/api/admin/')) {
+          const authErr = await verifyAdminAuth(request, env);
+          if (authErr) return authErr;
+        }
         if (path === '/api/admin/lightspeed/test' && method === 'GET') return apiLightspeedTest(env);
         if (path === '/api/admin/lightspeed/sync' && method === 'POST') return apiLightspeedSyncTeam(request, env);
         if (path === '/api/admin/lightspeed/sync-all' && method === 'POST') return apiLightspeedSyncAll(env);
@@ -59,7 +72,72 @@ function htmlResponse(html) {
   return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' } });
 }
 function corsHeaders() {
-  return { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
+  return { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type,X-Store-Token,X-Admin-Token' };
+}
+
+// ============================================================
+// AUTH & RATE LIMITING
+// ============================================================
+// Generate a secure token from PIN + secret
+async function generateToken(pin, salt) {
+  const data = new TextEncoder().encode(pin + ':' + salt + ':icelab-team-store');
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Verify store auth token (from X-Store-Token header)
+async function verifyStoreAuth(request, env) {
+  const token = request.headers.get('X-Store-Token');
+  if (!token) return json({ error: 'Authentication required' }, 401);
+  const teams = await getTeams(env);
+  for (const team of teams) {
+    if (!team.enabled) continue;
+    const validToken = await generateToken(team.pin, team.priceBookId);
+    if (token === validToken) return null; // auth passed
+  }
+  return json({ error: 'Invalid token' }, 401);
+}
+
+// Verify admin auth token (from X-Admin-Token header)
+async function verifyAdminAuth(request, env) {
+  const token = request.headers.get('X-Admin-Token');
+  if (!token) return json({ error: 'Admin authentication required' }, 401);
+  const config = await getConfig(env);
+  const validToken = await generateToken(config.adminPin, 'admin');
+  if (token !== validToken) return json({ error: 'Invalid admin token' }, 401);
+  return null; // auth passed
+}
+
+// Rate limiting for PIN attempts
+async function checkRateLimit(env, ip) {
+  const key = `ratelimit:${ip}`;
+  const data = await env.STORE_DATA.get(key, 'json');
+  if (data) {
+    const elapsed = Date.now() - data.firstAttempt;
+    if (data.attempts >= 5 && elapsed < 15 * 60 * 1000) {
+      const remaining = Math.ceil((15 * 60 * 1000 - elapsed) / 60000);
+      return { blocked: true, remaining };
+    }
+    if (elapsed >= 15 * 60 * 1000) return { blocked: false }; // window expired
+  }
+  return { blocked: false };
+}
+
+async function recordFailedAttempt(env, ip) {
+  const key = `ratelimit:${ip}`;
+  const data = await env.STORE_DATA.get(key, 'json') || { attempts: 0, firstAttempt: Date.now() };
+  const elapsed = Date.now() - data.firstAttempt;
+  if (elapsed >= 15 * 60 * 1000) {
+    // Reset window
+    await env.STORE_DATA.put(key, JSON.stringify({ attempts: 1, firstAttempt: Date.now() }), { expirationTtl: 900 });
+  } else {
+    data.attempts++;
+    await env.STORE_DATA.put(key, JSON.stringify(data), { expirationTtl: 900 });
+  }
+}
+
+async function clearRateLimit(env, ip) {
+  await env.STORE_DATA.delete(`ratelimit:${ip}`);
 }
 function generateId(prefix) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).substr(2, 6)}`;
@@ -141,19 +219,35 @@ async function lsFetch(env, endpoint, options = {}) {
 // PIN VERIFICATION — Multi-team
 // ============================================================
 async function apiVerifyPin(request, env) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const rl = await checkRateLimit(env, ip);
+  if (rl.blocked) return json({ error: `Too many attempts. Try again in ${rl.remaining} minute(s).` }, 429);
+
   const { pin } = await request.json();
   const teams = await getTeams(env);
   const team = teams.find(t => t.pin === pin && t.enabled);
   if (team) {
-    return json({ success: true, team: { name: team.name, slug: team.slug, priceBookId: team.priceBookId, logoUrl: team.logoUrl || '' } });
+    await clearRateLimit(env, ip);
+    const token = await generateToken(pin, team.priceBookId);
+    return json({ success: true, token, team: { name: team.name, slug: team.slug, priceBookId: team.priceBookId, logoUrl: team.logoUrl || '' } });
   }
+  await recordFailedAttempt(env, ip);
   return json({ error: 'Invalid PIN' }, 401);
 }
 
 async function apiVerifyAdminPin(request, env) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const rl = await checkRateLimit(env, 'admin:' + ip);
+  if (rl.blocked) return json({ error: `Too many attempts. Try again in ${rl.remaining} minute(s).` }, 429);
+
   const { pin } = await request.json();
   const config = await getConfig(env);
-  if (pin === config.adminPin) return json({ success: true });
+  if (pin === config.adminPin) {
+    await clearRateLimit(env, 'admin:' + ip);
+    const token = await generateToken(pin, 'admin');
+    return json({ success: true, token });
+  }
+  await recordFailedAttempt(env, 'admin:' + ip);
   return json({ error: 'Invalid PIN' }, 401);
 }
 
@@ -1201,6 +1295,8 @@ function storePage() {
 <script>
 let products=[],cart=JSON.parse(sessionStorage.getItem('team_cart')||'[]'),currentView='home';
 let teamContext=JSON.parse(sessionStorage.getItem('team_context')||'null');
+let storeToken=sessionStorage.getItem('store_token')||'';
+function authFetch(url,opts){opts=opts||{};opts.headers=opts.headers||{};opts.headers['X-Store-Token']=storeToken;return fetch(url,opts)}
 let storeSearchQuery='';let _searchDebounce=null;let selectedCategory='all';let sortBy='name-asc';
 
 // Check for ?team=slug param and show team name on PIN page
@@ -1234,12 +1330,14 @@ async function checkPin(){
     const data=await r.json();
     if(r.ok&&data.team){
       teamContext=data.team;
+      storeToken=data.token;
       sessionStorage.setItem('team_context',JSON.stringify(teamContext));
+      sessionStorage.setItem('store_token',storeToken);
       document.getElementById('pin-screen').style.display='none';
       document.getElementById('store-app').style.display='';
       loadStore();
     }else{
-      document.getElementById('pin-error').textContent='Invalid PIN';
+      document.getElementById('pin-error').textContent=data.error||'Invalid PIN';
       pinInputs.forEach(i=>i.value='');pinInputs[0].focus();
     }
   }catch(e){document.getElementById('pin-error').textContent='Connection error'}
@@ -1256,7 +1354,7 @@ async function loadStore(){
   document.getElementById('header-team-name').textContent='- '+teamContext.name;
   document.getElementById('main-content').innerHTML='<div class="loading">Loading products...</div>';
   try{
-    const r=await fetch('/api/products?priceBookId='+encodeURIComponent(teamContext.priceBookId));
+    const r=await authFetch('/api/products?priceBookId='+encodeURIComponent(teamContext.priceBookId));
     products=await r.json();
   }catch(e){products=[];}
   updateCartCount();
@@ -1340,7 +1438,7 @@ async function showProduct(prodId){
   window._scrollPos=window.scrollY;
   currentView='product';
   document.getElementById('main-content').innerHTML='<div class="loading">Loading...</div>';
-  const r=await fetch('/api/product/'+prodId+'?priceBookId='+encodeURIComponent(teamContext.priceBookId));
+  const r=await authFetch('/api/product/'+prodId+'?priceBookId='+encodeURIComponent(teamContext.priceBookId));
   if(!r.ok){showHome();return}
   const p=await r.json();
   window._currentProduct=p;
@@ -1574,7 +1672,7 @@ async function checkout(){
   sessionStorage.setItem('co_name',n);sessionStorage.setItem('co_email',e);sessionStorage.setItem('co_phone',ph);
   const btn=document.getElementById('checkout-btn');btn.disabled=true;btn.textContent='Processing...';
   try{
-    const r=await fetch('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:cart,customer:{name:n,email:e,phone:ph},teamName:teamContext?.name||'',teamSlug:teamContext?.slug||''})});
+    const r=await authFetch('/api/checkout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:cart,customer:{name:n,email:e,phone:ph},teamName:teamContext?.name||'',teamSlug:teamContext?.slug||''})});
     const d=await r.json();
     if(d.url)window.location.href=d.url;
     else{showToast(d.error||'Checkout failed');btn.disabled=false;btn.textContent='Checkout'}
@@ -1653,14 +1751,16 @@ pinInputs.forEach((inp,i)=>{
   inp.addEventListener('keydown',e=>{if(e.key==='Backspace'){if(!inp.value&&i>0){pinInputs[i-1].value='';pinInputs[i-1].focus()}else{inp.value=''}}});
   inp.addEventListener('focus',()=>inp.select());
 });
-async function checkAdminPin(){const pin=Array.from(pinInputs).map(i=>i.value).join('');if(pin.length<4)return;try{const r=await fetch('/api/verify-admin-pin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin})});if(r.ok){sessionStorage.setItem('admin_pin',pin);document.getElementById('admin-pin-screen').style.display='none';document.getElementById('admin-app').style.display='';loadAdmin()}else{document.getElementById('pin-error').textContent='Invalid PIN';pinInputs.forEach(i=>i.value='');pinInputs[0].focus()}}catch(e){document.getElementById('pin-error').textContent='Connection error'}}
-if(sessionStorage.getItem('admin_pin')){document.getElementById('admin-pin-screen').style.display='none';document.getElementById('admin-app').style.display='';loadAdmin()}
+let adminToken=sessionStorage.getItem('admin_token')||'';
+function adminFetch(url,opts){opts=opts||{};opts.headers=opts.headers||{};opts.headers['X-Admin-Token']=adminToken;return fetch(url,opts)}
+async function checkAdminPin(){const pin=Array.from(pinInputs).map(i=>i.value).join('');if(pin.length<4)return;try{const r=await fetch('/api/verify-admin-pin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin})});const data=await r.json();if(r.ok&&data.token){adminToken=data.token;sessionStorage.setItem('admin_token',adminToken);sessionStorage.setItem('admin_pin','1');document.getElementById('admin-pin-screen').style.display='none';document.getElementById('admin-app').style.display='';loadAdmin()}else{document.getElementById('pin-error').textContent=data.error||'Invalid PIN';pinInputs.forEach(i=>i.value='');pinInputs[0].focus()}}catch(e){document.getElementById('pin-error').textContent='Connection error'}}
+if(adminToken){document.getElementById('admin-pin-screen').style.display='none';document.getElementById('admin-app').style.display='';loadAdmin()}
 
 function toggleSidebar(){document.getElementById('sidebar').classList.toggle('open');document.getElementById('sidebar-overlay').classList.toggle('open')}
 
 async function loadAdmin(){
   try{
-    const[tr,cr]=await Promise.all([fetch('/api/admin/teams'),fetch('/api/admin/config')]);
+    const[tr,cr]=await Promise.all([adminFetch('/api/admin/teams'),adminFetch('/api/admin/config')]);
     adminTeams=await tr.json();
     adminConfig=await cr.json();
   }catch(e){console.error(e)}
@@ -1701,7 +1801,7 @@ async function renderImport(){
   c.innerHTML='<div style="margin-bottom:16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap"><select class="filter-select" id="team-select" onchange="selectedTeamIdx=this.selectedIndex;renderImport()">'+enabledTeams.map((t,i)=>'<option'+(i===selectedTeamIdx?' selected':'')+'>'+esc(t.name)+'</option>').join('')+'</select><button class="btn btn-primary btn-sm" onclick="syncTeam(\\''+esc(team.priceBookId)+'\\',\\''+esc(team.name)+'\\')\" id="sync-btn">${ICONS.sync} Sync Price Book</button></div><div class="loading" id="import-loading">Loading products...</div>';
 
   try{
-    const r=await fetch('/api/admin/import-products?priceBookId='+encodeURIComponent(team.priceBookId));
+    const r=await adminFetch('/api/admin/import-products?priceBookId='+encodeURIComponent(team.priceBookId));
     const data=await r.json();
     importProducts=data.products||[];
     renderImportTable(team);
@@ -1827,7 +1927,7 @@ async function syncTeam(priceBookId,teamName){
   const btn=document.getElementById('sync-btn');
   if(btn){btn.disabled=true;btn.innerHTML='Syncing...';}
   try{
-    const r=await fetch('/api/admin/lightspeed/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({priceBookId})});
+    const r=await adminFetch('/api/admin/lightspeed/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({priceBookId})});
     const data=await r.json();
     if(data.success){
       showToast('Synced '+data.totalProducts+' products for '+teamName);
@@ -1843,7 +1943,7 @@ async function renderProducts(){
   const c=document.getElementById('admin-content');
   c.innerHTML='<div class="loading">Loading products across all teams...</div>';
   try{
-    const r=await fetch('/api/admin/products');
+    const r=await adminFetch('/api/admin/products');
     allProducts=await r.json();
   }catch(e){allProducts=[];}
 
@@ -1903,7 +2003,7 @@ async function renderOrders(){
   const c=document.getElementById('admin-content');
   c.innerHTML='<div class="loading">Loading orders...</div>';
   try{
-    const r=await fetch('/api/admin/orders');
+    const r=await adminFetch('/api/admin/orders');
     adminOrders=await r.json();
   }catch(e){adminOrders=[];}
 
@@ -1982,7 +2082,7 @@ function readTeamsFromForm(){
 async function saveTeams(){
   const teams=readTeamsFromForm();
   try{
-    const r=await fetch('/api/admin/teams',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({teams})});
+    const r=await adminFetch('/api/admin/teams',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({teams})});
     if(r.ok){adminTeams=teams;showToast('Teams saved')}
     else showToast('Save failed');
   }catch(e){showToast('Error: '+e.message)}
@@ -1994,7 +2094,7 @@ async function saveConfig(){
     adminPin:document.getElementById('cfg-admin-pin').value.trim()||'9999'
   };
   try{
-    const r=await fetch('/api/admin/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    const r=await adminFetch('/api/admin/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
     if(r.ok){adminConfig={...adminConfig,...data};showToast('Configuration saved')}
     else showToast('Save failed');
   }catch(e){showToast('Error: '+e.message)}
@@ -2007,7 +2107,7 @@ async function saveStripe(){
     stripeWebhookSecret:document.getElementById('cfg-stripe-wh').value.trim()
   };
   try{
-    const r=await fetch('/api/admin/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    const r=await adminFetch('/api/admin/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
     if(r.ok){adminConfig={...adminConfig,...data};showToast('Stripe settings saved')}
     else showToast('Save failed');
   }catch(e){showToast('Error: '+e.message)}
@@ -2017,7 +2117,7 @@ async function testLightspeed(){
   const el=document.getElementById('ls-status');
   el.innerHTML='Testing connection...';
   try{
-    const r=await fetch('/api/admin/lightspeed/test');
+    const r=await adminFetch('/api/admin/lightspeed/test');
     const data=await r.json();
     if(data.success){el.innerHTML='<span style="color:#16a34a">'+esc(data.message)+'</span>'}
     else{el.innerHTML='<span style="color:#dc2626">'+esc(data.error||'Connection failed')+'</span>'}
@@ -2028,7 +2128,7 @@ async function fullSync(){
   const el=document.getElementById('ls-status');
   el.innerHTML='Syncing all teams...';
   try{
-    const r=await fetch('/api/admin/lightspeed/sync-all',{method:'POST'});
+    const r=await adminFetch('/api/admin/lightspeed/sync-all',{method:'POST'});
     const data=await r.json();
     if(data.success){
       const summary=data.results.map(r=>r.team+': '+(r.success?r.products+' products':'FAILED - '+r.error)).join(', ');
