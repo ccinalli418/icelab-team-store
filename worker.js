@@ -1456,6 +1456,7 @@ async function showProduct(prodId){
       imgHtml+='<button onclick="event.stopPropagation();changeImg(1)" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:rgba(255,255,255,0.9);border:none;border-radius:50%;width:32px;height:32px;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(0,0,0,0.2);transform:translateY(-50%) rotate(180deg)">${ICONS.back}</button>';
       imgHtml+='<div style="position:absolute;bottom:8px;left:50%;transform:translateX(-50%);display:flex;gap:6px">'+imgs.map((im,i)=>'<span style="width:8px;height:8px;border-radius:50%;background:'+(i===0?'#4f46e5':'rgba(0,0,0,0.3)')+'"></span>').join('')+'</div>';
     }
+    imgHtml+='<div style="position:absolute;bottom:'+(imgs.length>1?'28':'8')+'px;left:50%;transform:translateX(-50%);color:rgba(255,255,255,0.7);font-size:11px;background:rgba(0,0,0,0.4);padding:2px 10px;border-radius:10px;pointer-events:none">Click to zoom</div>';
     imgHtml+='</div>';
   }else{
     imgHtml='${ICONS.camera}';
@@ -1579,18 +1580,57 @@ function openLightbox(){
   const idx=window._imgIdx||0;
   const overlay=document.createElement('div');
   overlay.id='lightbox';
-  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:400;display:flex;align-items:center;justify-content:center;cursor:zoom-out';
-  overlay.onclick=()=>overlay.remove();
-  overlay.innerHTML='<img src="'+esc(imgs[idx].full||imgs[idx].standard)+'" style="max-width:90vw;max-height:90vh;object-fit:contain;border-radius:4px" onclick="event.stopPropagation()">'
-    +(imgs.length>1?'<button onclick="event.stopPropagation();lbNav(-1)" style="position:absolute;left:16px;top:50%;transform:translateY(-50%);background:rgba(255,255,255,0.9);border:none;border-radius:50%;width:40px;height:40px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center">${ICONS.back}</button><button onclick="event.stopPropagation();lbNav(1)" style="position:absolute;right:16px;top:50%;transform:translateY(-50%) rotate(180deg);background:rgba(255,255,255,0.9);border:none;border-radius:50%;width:40px;height:40px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center">${ICONS.back}</button>':'')
-    +'<button onclick="this.parentElement.remove()" style="position:absolute;top:16px;right:16px;background:rgba(255,255,255,0.9);border:none;border-radius:50%;width:32px;height:32px;cursor:pointer;display:flex;align-items:center;justify-content:center">${ICONS.x}</button>';
+  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.9);z-index:400;display:flex;align-items:center;justify-content:center';
+  // State
+  let zoom=1,panX=0,panY=0,dragging=false,dragStartX=0,dragStartY=0,startPanX=0,startPanY=0;
+  let pinchStartDist=0,pinchStartZoom=1;
+  const img=document.createElement('img');
+  img.src=imgs[idx].full||imgs[idx].standard;
+  img.style.cssText='max-width:90vw;max-height:90vh;object-fit:contain;border-radius:4px;transition:transform 0.15s ease;transform-origin:center center;cursor:grab;user-select:none;-webkit-user-drag:none';
+  function applyTransform(){img.style.transform='scale('+zoom+') translate('+panX+'px,'+panY+'px)';img.style.cursor=zoom>1?'grab':'zoom-in'}
+  // Scroll to zoom (desktop)
+  img.addEventListener('wheel',function(e){e.preventDefault();e.stopPropagation();const delta=e.deltaY>0?-0.3:0.3;zoom=Math.min(4,Math.max(1,zoom+delta));if(zoom===1){panX=0;panY=0}applyTransform()},{passive:false});
+  // Click+drag to pan (desktop)
+  img.addEventListener('mousedown',function(e){if(zoom<=1)return;e.preventDefault();dragging=true;dragStartX=e.clientX;dragStartY=e.clientY;startPanX=panX;startPanY=panY;img.style.cursor='grabbing';img.style.transition='none'});
+  document.addEventListener('mousemove',function lbMove(e){if(!dragging)return;panX=startPanX+(e.clientX-dragStartX)/zoom;panY=startPanY+(e.clientY-dragStartY)/zoom;applyTransform()});
+  document.addEventListener('mouseup',function lbUp(){if(dragging){dragging=false;img.style.cursor=zoom>1?'grab':'zoom-in';img.style.transition='transform 0.15s ease'}});
+  // Pinch to zoom (mobile)
+  function getTouchDist(t){return Math.hypot(t[0].clientX-t[1].clientX,t[0].clientY-t[1].clientY)}
+  img.addEventListener('touchstart',function(e){if(e.touches.length===2){e.preventDefault();pinchStartDist=getTouchDist(e.touches);pinchStartZoom=zoom;img.style.transition='none'}else if(e.touches.length===1&&zoom>1){dragging=true;dragStartX=e.touches[0].clientX;dragStartY=e.touches[0].clientY;startPanX=panX;startPanY=panY;img.style.transition='none'}},{passive:false});
+  img.addEventListener('touchmove',function(e){if(e.touches.length===2){e.preventDefault();const dist=getTouchDist(e.touches);zoom=Math.min(4,Math.max(1,pinchStartZoom*(dist/pinchStartDist)));if(zoom===1){panX=0;panY=0}applyTransform()}else if(e.touches.length===1&&dragging){e.preventDefault();panX=startPanX+(e.touches[0].clientX-dragStartX)/zoom;panY=startPanY+(e.touches[0].clientY-dragStartY)/zoom;applyTransform()}},{passive:false});
+  img.addEventListener('touchend',function(e){dragging=false;img.style.transition='transform 0.15s ease'});
+  // Double-click to toggle zoom
+  img.addEventListener('dblclick',function(e){e.stopPropagation();if(zoom>1){zoom=1;panX=0;panY=0}else{zoom=2}applyTransform()});
+  img.addEventListener('click',function(e){e.stopPropagation()});
+  // Close on background click
+  overlay.addEventListener('click',function(e){if(e.target===overlay){overlay.remove();document.removeEventListener('mousemove',arguments.callee);document.removeEventListener('mouseup',arguments.callee)}});
+  // Build overlay
+  overlay.appendChild(img);
+  // Zoom indicator
+  const zoomHint=document.createElement('div');
+  zoomHint.style.cssText='position:absolute;bottom:20px;left:50%;transform:translateX(-50%);color:rgba(255,255,255,0.6);font-size:12px;pointer-events:none';
+  zoomHint.textContent='Scroll to zoom \u00b7 Drag to pan \u00b7 Double-click to reset';
+  overlay.appendChild(zoomHint);
+  // Nav arrows
+  if(imgs.length>1){
+    const mkNav=(dir,rot,pos)=>{const b=document.createElement('button');b.innerHTML='${ICONS.back}';b.style.cssText='position:absolute;'+pos+';top:50%;transform:translateY(-50%)'+rot+';background:rgba(255,255,255,0.9);border:none;border-radius:50%;width:40px;height:40px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center';b.onclick=e=>{e.stopPropagation();lbNav(dir)};return b};
+    overlay.appendChild(mkNav(-1,'','left:16px'));
+    overlay.appendChild(mkNav(1,' rotate(180deg)','right:16px'));
+  }
+  // Close button
+  const closeBtn=document.createElement('button');
+  closeBtn.innerHTML='${ICONS.x}';
+  closeBtn.style.cssText='position:absolute;top:16px;right:16px;background:rgba(255,255,255,0.9);border:none;border-radius:50%;width:32px;height:32px;cursor:pointer;display:flex;align-items:center;justify-content:center';
+  closeBtn.onclick=()=>overlay.remove();
+  overlay.appendChild(closeBtn);
   document.body.appendChild(overlay);
 }
 function lbNav(d){
   const imgs=window._prodImages;if(!imgs||imgs.length<2)return;
   window._imgIdx=((window._imgIdx||0)+d+imgs.length)%imgs.length;
-  const lbImg=document.querySelector('#lightbox img');if(lbImg)lbImg.src=imgs[window._imgIdx].full||imgs[window._imgIdx].standard;
-  changeImg(0);// sync dots
+  const lbImg=document.querySelector('#lightbox img');
+  if(lbImg){lbImg.src=imgs[window._imgIdx].full||imgs[window._imgIdx].standard;lbImg.style.transform='scale(1) translate(0px,0px)'}
+  changeImg(0);
 }
 
 function addToCart(){
