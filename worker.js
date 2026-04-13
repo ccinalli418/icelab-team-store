@@ -1588,18 +1588,18 @@ function openLightbox(){
 
   // Image container with zoom layer
   const wrap=document.createElement('div');
-  wrap.style.cssText='position:relative;max-width:90vw;max-height:90vh;overflow:hidden;cursor:crosshair';
+  wrap.style.cssText='position:relative;width:100vw;height:100vh;overflow:hidden;cursor:crosshair';
 
   const img=document.createElement('img');
   img.id='lb-main';
   img.src=imgs[idx].full||imgs[idx].standard;
-  img.style.cssText='max-width:90vw;max-height:90vh;object-fit:contain;border-radius:4px;display:block';
+  img.style.cssText='width:100%;height:100%;object-fit:contain;display:block';
   img.onclick=e=>e.stopPropagation();
 
   const zoomImg=document.createElement('img');
   zoomImg.id='lb-zoom';
   zoomImg.src=imgs[idx].full||imgs[idx].standard;
-  zoomImg.style.cssText='position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;opacity:0;pointer-events:none;transform-origin:0% 0%;will-change:transform;transition:opacity 0.15s';
+  zoomImg.style.cssText='position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;opacity:0;pointer-events:none;transform-origin:0% 0%;will-change:transform';
 
   // Hover zoom inside lightbox (desktop)
   wrap.addEventListener('mousemove',function(e){
@@ -1608,7 +1608,7 @@ function openLightbox(){
     const x=(e.clientX-rect.left)/rect.width;
     const y=(e.clientY-rect.top)/rect.height;
     const natW=zoomImg.naturalWidth||1200;
-    const maxZoom=Math.max(1.5,Math.min(2.5,natW/rect.width));
+    const maxZoom=Math.max(2,Math.min(4,natW/rect.width));
     zoomImg.style.opacity='1';
     zoomImg.style.transform='scale('+maxZoom+')';
     zoomImg.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
@@ -1632,7 +1632,7 @@ function openLightbox(){
     const x=(t.clientX-rect.left)/rect.width;
     const y=(t.clientY-rect.top)/rect.height;
     const natW=zoomImg.naturalWidth||1200;
-    const maxZoom=Math.max(1.5,Math.min(2.5,natW/rect.width));
+    const maxZoom=Math.max(2,Math.min(4,natW/rect.width));
     zoomImg.style.opacity='1';
     zoomImg.style.transform='scale('+maxZoom+')';
     zoomImg.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
