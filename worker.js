@@ -1601,14 +1601,24 @@ function openLightbox(){
   zoomImg.src=imgs[idx].full||imgs[idx].standard;
   zoomImg.style.cssText='position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;opacity:0;pointer-events:none;transform-origin:0% 0%;will-change:transform';
 
+  // Preload zoom image to get naturalWidth
+  let zoomReady=false;
+  zoomImg.onload=function(){zoomReady=true};
+
   // Hover zoom inside lightbox (desktop)
   wrap.addEventListener('mousemove',function(e){
     e.stopPropagation();
-    const rect=wrap.getBoundingClientRect();
+    if(!zoomReady)return;
+    const rect=img.getBoundingClientRect();
     const x=(e.clientX-rect.left)/rect.width;
     const y=(e.clientY-rect.top)/rect.height;
-    const natW=zoomImg.naturalWidth||1200;
-    const maxZoom=Math.max(2,Math.min(4,natW/rect.width));
+    // Clamp to image area
+    if(x<0||x>1||y<0||y>1){zoomImg.style.opacity='0';return}
+    const natW=zoomImg.naturalWidth;
+    const displayW=rect.width;
+    // Never zoom beyond native resolution
+    const maxZoom=natW>0?Math.min(4,natW/displayW):2;
+    if(maxZoom<=1.1){zoomImg.style.opacity='0';return}// image too small to zoom
     zoomImg.style.opacity='1';
     zoomImg.style.transform='scale('+maxZoom+')';
     zoomImg.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
@@ -1631,8 +1641,11 @@ function openLightbox(){
     const rect=wrap.getBoundingClientRect();
     const x=(t.clientX-rect.left)/rect.width;
     const y=(t.clientY-rect.top)/rect.height;
-    const natW=zoomImg.naturalWidth||1200;
-    const maxZoom=Math.max(2,Math.min(4,natW/rect.width));
+    if(!zoomReady)return;
+    const natW=zoomImg.naturalWidth;
+    const displayW=rect.width;
+    const maxZoom=natW>0?Math.min(4,natW/displayW):2;
+    if(maxZoom<=1.1)return;
     zoomImg.style.opacity='1';
     zoomImg.style.transform='scale('+maxZoom+')';
     zoomImg.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
