@@ -1450,17 +1450,15 @@ async function showProduct(prodId){
   window._imgIdx=0;
   let imgHtml='';
   if(imgs.length>0){
-    const fullSrc=esc(imgs[0].full||imgs[0].standard);
     const stdSrc=esc(imgs[0].standard);
-    imgHtml='<div id="pd-zoom-wrap" style="position:relative;overflow:hidden;cursor:crosshair" onclick="openLightbox()" onmousemove="hoverZoom(event)" onmouseleave="hoverZoomOut()" ontouchstart="touchZoomStart(event)" ontouchmove="touchZoomMove(event)" ontouchend="hoverZoomOut()">';
-    imgHtml+='<img id="pd-main-img" src="'+stdSrc+'" style="width:100%;height:100%;object-fit:cover;transition:opacity 0.15s">';
-    imgHtml+='<img id="pd-zoom-img" src="'+fullSrc+'" style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;opacity:0;pointer-events:none;transform-origin:0 0;will-change:transform">';
+    imgHtml='<div style="position:relative;cursor:pointer" onclick="openLightbox()">';
+    imgHtml+='<img id="pd-main-img" src="'+stdSrc+'" style="width:100%;height:100%;object-fit:cover">';
     if(imgs.length>1){
       imgHtml+='<button onclick="event.stopPropagation();changeImg(-1)" style="position:absolute;left:8px;top:50%;transform:translateY(-50%);background:rgba(255,255,255,0.9);border:none;border-radius:50%;width:32px;height:32px;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(0,0,0,0.2);z-index:2">${ICONS.back}</button>';
       imgHtml+='<button onclick="event.stopPropagation();changeImg(1)" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:rgba(255,255,255,0.9);border:none;border-radius:50%;width:32px;height:32px;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(0,0,0,0.2);transform:translateY(-50%) rotate(180deg);z-index:2">${ICONS.back}</button>';
       imgHtml+='<div style="position:absolute;bottom:8px;left:50%;transform:translateX(-50%);display:flex;gap:6px;z-index:2">'+imgs.map((im,i)=>'<span style="width:8px;height:8px;border-radius:50%;background:'+(i===0?'#4f46e5':'rgba(0,0,0,0.3)')+'"></span>').join('')+'</div>';
     }
-    imgHtml+='<div id="pd-zoom-hint" style="position:absolute;bottom:'+(imgs.length>1?'28':'8')+'px;left:50%;transform:translateX(-50%);color:rgba(255,255,255,0.7);font-size:11px;background:rgba(0,0,0,0.4);padding:2px 10px;border-radius:10px;pointer-events:none;z-index:2">Hover to zoom</div>';
+    imgHtml+='<div style="position:absolute;bottom:'+(imgs.length>1?'28':'8')+'px;left:50%;transform:translateX(-50%);color:rgba(255,255,255,0.7);font-size:11px;background:rgba(0,0,0,0.4);padding:2px 10px;border-radius:10px;pointer-events:none;z-index:2">Click to zoom</div>';
     imgHtml+='</div>';
   }else{
     imgHtml='${ICONS.camera}';
@@ -1574,76 +1572,93 @@ function changeImg(d){
   const imgs=window._prodImages;if(!imgs||imgs.length<2)return;
   window._imgIdx=((window._imgIdx||0)+d+imgs.length)%imgs.length;
   const mainImg=document.getElementById('pd-main-img');if(mainImg)mainImg.src=imgs[window._imgIdx].standard;
-  const zoomImg=document.getElementById('pd-zoom-img');if(zoomImg)zoomImg.src=imgs[window._imgIdx].full||imgs[window._imgIdx].standard;
   // Update dots
   document.querySelectorAll('.pd-image span[style]').forEach((dot,i)=>{
     if(dot.style.borderRadius==='50%')dot.style.background=i===window._imgIdx?'#4f46e5':'rgba(0,0,0,0.3)';
   });
 }
-// Hover-to-zoom (Amazon style)
-function hoverZoom(e){
-  const wrap=document.getElementById('pd-zoom-wrap');
-  const zImg=document.getElementById('pd-zoom-img');
-  const hint=document.getElementById('pd-zoom-hint');
-  if(!wrap||!zImg)return;
-  const rect=wrap.getBoundingClientRect();
-  const x=(e.clientX-rect.left)/rect.width;
-  const y=(e.clientY-rect.top)/rect.height;
-  // Calculate max zoom based on native image resolution vs container
-  const natW=zImg.naturalWidth||1200;
-  const maxZoom=Math.max(1.2,Math.min(2.5,natW/rect.width));
-  zImg.style.opacity='1';
-  zImg.style.transform='scale('+maxZoom+')';
-  zImg.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
-  if(hint)hint.style.opacity='0';
-}
-function hoverZoomOut(){
-  const zImg=document.getElementById('pd-zoom-img');
-  const hint=document.getElementById('pd-zoom-hint');
-  if(zImg){zImg.style.opacity='0';zImg.style.transform='scale(1)'}
-  if(hint)hint.style.opacity='1';
-}
-// Touch: tap-and-hold to zoom, drag to pan
-let _touchZoomActive=false;let _touchTimer=null;
-function touchZoomStart(e){
-  if(e.touches.length!==1)return;
-  _touchTimer=setTimeout(()=>{_touchZoomActive=true;touchZoomMove(e)},300);
-}
-function touchZoomMove(e){
-  if(!_touchZoomActive||!e.touches.length)return;
-  e.preventDefault();
-  const touch=e.touches[0];
-  const wrap=document.getElementById('pd-zoom-wrap');
-  const zImg=document.getElementById('pd-zoom-img');
-  if(!wrap||!zImg)return;
-  const rect=wrap.getBoundingClientRect();
-  const x=(touch.clientX-rect.left)/rect.width;
-  const y=(touch.clientY-rect.top)/rect.height;
-  const natW=zImg.naturalWidth||1200;
-  const maxZoom=Math.max(1.2,Math.min(2.5,natW/rect.width));
-  zImg.style.opacity='1';
-  zImg.style.transform='scale('+maxZoom+')';
-  zImg.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
-}
-// Lightbox (simple full-size view, no scroll zoom)
+// Lightbox with hover-to-zoom inside
 function openLightbox(){
-  if(_touchZoomActive){_touchZoomActive=false;return}
   const imgs=window._prodImages;if(!imgs||!imgs.length)return;
   const idx=window._imgIdx||0;
   const overlay=document.createElement('div');
   overlay.id='lightbox';
   overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.9);z-index:400;display:flex;align-items:center;justify-content:center';
   overlay.onclick=e=>{if(e.target===overlay)overlay.remove()};
+
+  // Image container with zoom layer
+  const wrap=document.createElement('div');
+  wrap.style.cssText='position:relative;max-width:90vw;max-height:90vh;overflow:hidden;cursor:crosshair';
+
   const img=document.createElement('img');
+  img.id='lb-main';
   img.src=imgs[idx].full||imgs[idx].standard;
-  img.style.cssText='max-width:90vw;max-height:90vh;object-fit:contain;border-radius:4px';
+  img.style.cssText='max-width:90vw;max-height:90vh;object-fit:contain;border-radius:4px;display:block';
   img.onclick=e=>e.stopPropagation();
-  overlay.appendChild(img);
+
+  const zoomImg=document.createElement('img');
+  zoomImg.id='lb-zoom';
+  zoomImg.src=imgs[idx].full||imgs[idx].standard;
+  zoomImg.style.cssText='position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;opacity:0;pointer-events:none;transform-origin:0% 0%;will-change:transform;transition:opacity 0.15s';
+
+  // Hover zoom inside lightbox (desktop)
+  wrap.addEventListener('mousemove',function(e){
+    e.stopPropagation();
+    const rect=wrap.getBoundingClientRect();
+    const x=(e.clientX-rect.left)/rect.width;
+    const y=(e.clientY-rect.top)/rect.height;
+    const natW=zoomImg.naturalWidth||1200;
+    const maxZoom=Math.max(1.5,Math.min(2.5,natW/rect.width));
+    zoomImg.style.opacity='1';
+    zoomImg.style.transform='scale('+maxZoom+')';
+    zoomImg.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
+  });
+  wrap.addEventListener('mouseleave',function(){
+    zoomImg.style.opacity='0';
+    zoomImg.style.transform='scale(1)';
+  });
+
+  // Mobile: tap-and-hold to zoom, drag to pan
+  let touchActive=false,touchTimer=null;
+  wrap.addEventListener('touchstart',function(e){
+    if(e.touches.length!==1)return;
+    touchTimer=setTimeout(()=>{touchActive=true},300);
+  },{passive:true});
+  wrap.addEventListener('touchmove',function(e){
+    if(!touchActive||!e.touches.length)return;
+    e.preventDefault();
+    const t=e.touches[0];
+    const rect=wrap.getBoundingClientRect();
+    const x=(t.clientX-rect.left)/rect.width;
+    const y=(t.clientY-rect.top)/rect.height;
+    const natW=zoomImg.naturalWidth||1200;
+    const maxZoom=Math.max(1.5,Math.min(2.5,natW/rect.width));
+    zoomImg.style.opacity='1';
+    zoomImg.style.transform='scale('+maxZoom+')';
+    zoomImg.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
+  },{passive:false});
+  wrap.addEventListener('touchend',function(){
+    clearTimeout(touchTimer);touchActive=false;
+    zoomImg.style.opacity='0';zoomImg.style.transform='scale(1)';
+  });
+
+  wrap.appendChild(img);
+  wrap.appendChild(zoomImg);
+  overlay.appendChild(wrap);
+
+  // Zoom hint
+  const hint=document.createElement('div');
+  hint.style.cssText='position:absolute;bottom:20px;left:50%;transform:translateX(-50%);color:rgba(255,255,255,0.5);font-size:12px;pointer-events:none';
+  hint.textContent='Hover to zoom';
+  overlay.appendChild(hint);
+
+  // Nav arrows
   if(imgs.length>1){
     const mkNav=(dir,rot,pos)=>{const b=document.createElement('button');b.innerHTML='${ICONS.back}';b.style.cssText='position:absolute;'+pos+';top:50%;transform:translateY(-50%)'+rot+';background:rgba(255,255,255,0.9);border:none;border-radius:50%;width:40px;height:40px;cursor:pointer;display:flex;align-items:center;justify-content:center';b.onclick=e=>{e.stopPropagation();lbNav(dir)};return b};
     overlay.appendChild(mkNav(-1,'','left:16px'));
     overlay.appendChild(mkNav(1,' rotate(180deg)','right:16px'));
   }
+  // Close button
   const closeBtn=document.createElement('button');
   closeBtn.innerHTML='${ICONS.x}';
   closeBtn.style.cssText='position:absolute;top:16px;right:16px;background:rgba(255,255,255,0.9);border:none;border-radius:50%;width:32px;height:32px;cursor:pointer;display:flex;align-items:center;justify-content:center';
@@ -1654,8 +1669,9 @@ function openLightbox(){
 function lbNav(d){
   const imgs=window._prodImages;if(!imgs||imgs.length<2)return;
   window._imgIdx=((window._imgIdx||0)+d+imgs.length)%imgs.length;
-  const lbImg=document.querySelector('#lightbox img');
-  if(lbImg)lbImg.src=imgs[window._imgIdx].full||imgs[window._imgIdx].standard;
+  const src=imgs[window._imgIdx].full||imgs[window._imgIdx].standard;
+  const lbMain=document.getElementById('lb-main');if(lbMain)lbMain.src=src;
+  const lbZoom=document.getElementById('lb-zoom');if(lbZoom){lbZoom.src=src;lbZoom.style.opacity='0';lbZoom.style.transform='scale(1)'}
   changeImg(0);
 }
 
