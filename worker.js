@@ -1610,7 +1610,7 @@ function openLightbox(){
     if(x<0||x>1||y<0||y>1){zoomImg.style.opacity='0';return}
     const natW=zoomImg.naturalWidth||1920;
     const displayW=rect.width||800;
-    const maxZoom=Math.max(2,Math.min(4,natW/displayW));
+    const maxZoom=Math.max(1.5,Math.min(2.5,natW/displayW));
     zoomImg.style.opacity='1';
     zoomImg.style.transform='scale('+maxZoom+')';
     zoomImg.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
@@ -1635,7 +1635,7 @@ function openLightbox(){
     const y=(t.clientY-rect.top)/rect.height;
     const natW=zoomImg.naturalWidth||1920;
     const displayW=rect.width||800;
-    const maxZoom=Math.max(2,Math.min(4,natW/displayW));
+    const maxZoom=Math.max(1.5,Math.min(2.5,natW/displayW));
     zoomImg.style.opacity='1';
     zoomImg.style.transform='scale('+maxZoom+')';
     zoomImg.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
