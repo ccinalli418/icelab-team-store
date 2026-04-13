@@ -444,11 +444,13 @@ function groupByParent(products) {
   }
 
   // Merge standalones into existing parent groups if their product ID matches a parent group ID
-  // (happens when price book includes both parent and child products)
+  // The parent product itself is also a purchasable variant — add it to the group
   const result = [...Object.values(parents)];
   for (const s of standalone) {
     if (parents[s.lightspeedProductId]) {
-      // This standalone IS the parent product — already represented by its children group, skip it
+      // This standalone IS the parent product AND a purchasable variant — add it to its own group
+      parents[s.lightspeedProductId].variants.push(s);
+      parents[s.lightspeedProductId].totalStock += (s.stock || 0);
       continue;
     }
     result.push({ ...s, id: s.lightspeedProductId, totalStock: s.stock || 0, hasVariants: false, variants: [] });
@@ -472,8 +474,10 @@ async function apiGetProduct(url, productId, env) {
 
   const products = await getPriceBookProducts(env, priceBookId);
 
-  // Find all variants for this parent
+  // Find all variants for this parent, including the parent product itself if it's a purchasable variant
   const variants = products.filter(p => p.parentId === productId);
+  const parentAsVariant = products.find(p => p.lightspeedProductId === productId && !p.parentId);
+  if (parentAsVariant && variants.length > 0) variants.push(parentAsVariant);
   if (variants.length > 0) {
     const first = variants[0];
     // Collect all unique images from all variants
