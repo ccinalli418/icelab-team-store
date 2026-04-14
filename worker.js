@@ -1590,38 +1590,31 @@ function openLightbox(){
   overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.9);z-index:400;display:flex;align-items:center;justify-content:center';
   overlay.onclick=e=>{if(e.target===overlay)overlay.remove()};
 
-  // Image container with zoom layer
+  // Single image with zoom on hover
   const wrap=document.createElement('div');
   wrap.style.cssText='position:relative;width:100vw;height:100vh;overflow:hidden;cursor:crosshair';
 
   const img=document.createElement('img');
   img.id='lb-main';
   img.src=imgs[idx].full||imgs[idx].standard;
-  img.style.cssText='width:100%;height:100%;object-fit:contain;display:block';
+  img.style.cssText='width:100%;height:100%;object-fit:contain;display:block;transition:transform 0.1s ease;will-change:transform';
   img.onclick=e=>e.stopPropagation();
 
-  const zoomImg=document.createElement('img');
-  zoomImg.id='lb-zoom';
-  zoomImg.src=imgs[idx].full||imgs[idx].standard;
-  zoomImg.style.cssText='position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;opacity:0;pointer-events:none;transform-origin:center center;will-change:transform';
-
-  // Hover zoom inside lightbox (desktop)
+  // Hover zoom (desktop) — single image, transform directly
   wrap.addEventListener('mousemove',function(e){
     e.stopPropagation();
-    const rect=img.getBoundingClientRect();
+    const rect=wrap.getBoundingClientRect();
     const x=(e.clientX-rect.left)/rect.width;
     const y=(e.clientY-rect.top)/rect.height;
-    if(x<0||x>1||y<0||y>1){zoomImg.style.opacity='0';return}
-    const natW=zoomImg.naturalWidth||1920;
+    if(x<0||x>1||y<0||y>1){img.style.transform='scale(1)';return}
+    const natW=img.naturalWidth||1920;
     const displayW=rect.width||800;
     const maxZoom=Math.max(1.3,Math.min(1.8,natW/displayW));
-    zoomImg.style.opacity='1';
-    zoomImg.style.transform='scale('+maxZoom+')';
-    zoomImg.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
+    img.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
+    img.style.transform='scale('+maxZoom+')';
   });
   wrap.addEventListener('mouseleave',function(){
-    zoomImg.style.opacity='0';
-    zoomImg.style.transform='scale(1)';
+    img.style.transform='scale(1)';
   });
 
   // Mobile: tap-and-hold to zoom, drag to pan
@@ -1637,20 +1630,18 @@ function openLightbox(){
     const rect=wrap.getBoundingClientRect();
     const x=(t.clientX-rect.left)/rect.width;
     const y=(t.clientY-rect.top)/rect.height;
-    const natW=zoomImg.naturalWidth||1920;
+    const natW=img.naturalWidth||1920;
     const displayW=rect.width||800;
     const maxZoom=Math.max(1.3,Math.min(1.8,natW/displayW));
-    zoomImg.style.opacity='1';
-    zoomImg.style.transform='scale('+maxZoom+')';
-    zoomImg.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
+    img.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
+    img.style.transform='scale('+maxZoom+')';
   },{passive:false});
   wrap.addEventListener('touchend',function(){
     clearTimeout(touchTimer);touchActive=false;
-    zoomImg.style.opacity='0';zoomImg.style.transform='scale(1)';
+    img.style.transform='scale(1)';
   });
 
   wrap.appendChild(img);
-  wrap.appendChild(zoomImg);
   overlay.appendChild(wrap);
 
   // Zoom hint
@@ -1677,8 +1668,7 @@ function lbNav(d){
   const imgs=window._prodImages;if(!imgs||imgs.length<2)return;
   window._imgIdx=((window._imgIdx||0)+d+imgs.length)%imgs.length;
   const src=imgs[window._imgIdx].full||imgs[window._imgIdx].standard;
-  const lbMain=document.getElementById('lb-main');if(lbMain)lbMain.src=src;
-  const lbZoom=document.getElementById('lb-zoom');if(lbZoom){lbZoom.src=src;lbZoom.style.opacity='0';lbZoom.style.transform='scale(1)'}
+  const lbMain=document.getElementById('lb-main');if(lbMain){lbMain.src=src;lbMain.style.transform='scale(1)'}
   changeImg(0);
 }
 
