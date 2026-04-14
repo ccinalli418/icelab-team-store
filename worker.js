@@ -1603,7 +1603,7 @@ function openLightbox(){
   const zoomImg=document.createElement('img');
   zoomImg.id='lb-zoom';
   zoomImg.src=imgs[idx].full||imgs[idx].standard;
-  zoomImg.style.cssText='position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;opacity:0;pointer-events:none;transform-origin:0% 0%;will-change:transform';
+  zoomImg.style.cssText='position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;opacity:0;pointer-events:none;transform-origin:center center;will-change:transform';
 
   // Hover zoom inside lightbox (desktop)
   wrap.addEventListener('mousemove',function(e){
@@ -1614,7 +1614,7 @@ function openLightbox(){
     if(x<0||x>1||y<0||y>1){zoomImg.style.opacity='0';return}
     const natW=zoomImg.naturalWidth||1920;
     const displayW=rect.width||800;
-    const maxZoom=Math.max(1.5,Math.min(2.5,natW/displayW));
+    const maxZoom=Math.max(1.3,Math.min(1.8,natW/displayW));
     zoomImg.style.opacity='1';
     zoomImg.style.transform='scale('+maxZoom+')';
     zoomImg.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
@@ -1639,7 +1639,7 @@ function openLightbox(){
     const y=(t.clientY-rect.top)/rect.height;
     const natW=zoomImg.naturalWidth||1920;
     const displayW=rect.width||800;
-    const maxZoom=Math.max(1.5,Math.min(2.5,natW/displayW));
+    const maxZoom=Math.max(1.3,Math.min(1.8,natW/displayW));
     zoomImg.style.opacity='1';
     zoomImg.style.transform='scale('+maxZoom+')';
     zoomImg.style.transformOrigin=(x*100)+'% '+(y*100)+'%';
